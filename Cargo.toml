@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust ext4 filesystem driver. Exposes a C ABI (ext4rs_*) suitable for FFI from Swift/C/Go/etc."
-repository = "https://github.com/christhomas/ext4-rust"
+repository = "https://github.com/christhomas/rust-ext4fs"
 
 [lib]
 name = "ext4rs"
