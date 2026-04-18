@@ -19,8 +19,11 @@
 //!
 //! Phase 4 (write path, in progress):
 //! - ext4rs_mount_rw(device_path) -> *mut ext4rs_fs_t
-//! - ext4rs_truncate(fs, path, new_size) -> int (shrink only; multi-level
-//!   extent trees rejected until extent_mut lands that path)
+//! - ext4rs_truncate(fs, path, new_size) -> int (shrink + sparse grow)
+//! - ext4rs_symlink(fs, target, linkpath) -> u32 inode (fast + slow path)
+//! - ext4rs_chmod(fs, path, mode) -> int
+//! - ext4rs_chown(fs, path, uid, gid) -> int
+//! - ext4rs_utimens(fs, path, atime_sec, atime_nsec, mtime_sec, mtime_nsec) -> int
 //! - ext4rs_unlink(fs, path) -> int
 //! - ext4rs_write_file(fs, path, data, len) -> i64 (save-as replace body)
 //!
@@ -915,12 +918,21 @@ pub unsafe extern "C" fn ext4rs_getxattr(
 // create/unlink/write_file follow as the write path matures.
 // ===========================================================================
 
-/// Shrink a file to `new_size`. Only valid when the device was mounted R/W
-/// (e.g. via `ext4rs_mount_rw`). Returns 0 on success, -1 on failure
+/// Truncate a file to `new_size`. Only valid when the device was mounted
+/// R/W (e.g. via `ext4rs_mount_rw`). Returns 0 on success, -1 on failure
 /// with details in `ext4rs_last_error`.
 ///
-/// Growing a file with truncate is not yet implemented (sparse grow would
-/// be trivial, but the current C ABI callers don't need it).
+/// Both directions are supported:
+/// - **Shrink** (`new_size < inode.size`): frees the dropped extents,
+///   updates block-bitmap + BGD + SB counters, patches i_size +
+///   i_blocks + inode csum.
+/// - **Sparse grow** (`new_size >= inode.size`): pure metadata update;
+///   ext4's extent tree treats unmapped logical blocks as zero-filled
+///   holes, so no block allocation happens. Only i_size, i_mtime,
+///   i_ctime, and the inode checksum change.
+///
+/// Refuses directories (POSIX EISDIR); refuses symlinks and special
+/// files (EINVAL).
 #[no_mangle]
 pub unsafe extern "C" fn ext4rs_truncate(
     fs: *mut ext4rs_fs_t,
