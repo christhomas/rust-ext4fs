@@ -313,6 +313,15 @@ int ext4rs_chown(ext4rs_fs_t *fs, const char *path,
 uint32_t ext4rs_symlink(ext4rs_fs_t *fs, const char *target,
                          const char *linkpath);
 
+/* Set (create or replace) the extended attribute `name` on `path` with
+ * `value_len` bytes from `value`. `name` must be fully-qualified
+ * (e.g. "user.com.apple.FinderInfo"). v1: in-inode xattrs only;
+ * ENOSPC if the in-inode region is too small; external-block spill
+ * not implemented. Returns 0 on success, -1 on failure. */
+int ext4rs_setxattr(ext4rs_fs_t *fs, const char *path,
+                     const char *name, const void *value,
+                     size_t value_len);
+
 /* Remove the extended attribute `name` from the inode at `path`.
  * `name` must be fully-qualified (carry a known namespace prefix like
  * "user." or "security."). v1: in-inode xattrs only; external-block

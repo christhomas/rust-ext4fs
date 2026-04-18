@@ -1458,3 +1458,53 @@ pub unsafe extern "C" fn ext4rs_removexattr(
         }),
     )
 }
+
+/// Set (create or replace) the extended attribute `name` on `path` with
+/// `value_len` bytes from `value`. `name` must be fully-qualified
+/// (carry a known namespace prefix like "user.").
+///
+/// v1 scope: in-inode xattrs only. ENOSPC if the in-inode region is
+/// too small; external-block spill is not implemented.
+///
+/// Returns 0 on success, -1 on failure with details in
+/// `ext4rs_last_error`. `ext4rs_last_errno` codes: EINVAL on unknown
+/// prefix or null args, ENAMETOOLONG on >255-byte suffix, ENOSPC on
+/// in-inode overflow, EROFS on RO mount.
+#[no_mangle]
+pub unsafe extern "C" fn ext4rs_setxattr(
+    fs: *mut ext4rs_fs_t,
+    path: *const c_char,
+    name: *const c_char,
+    value: *const c_void,
+    value_len: usize,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() || name.is_null() {
+                set_err_msg("null fs/path/name", EINVAL);
+                return -1;
+            }
+            if value.is_null() && value_len > 0 {
+                set_err_msg("null value with nonzero len", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            let name_str = cstr_to_str(name);
+            let value_bytes = if value_len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(value as *const u8, value_len)
+            };
+            match fs_ref.apply_setxattr(path_str, name_str, value_bytes) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("setxattr {path_str} {name_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}

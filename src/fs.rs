@@ -456,6 +456,55 @@ impl Filesystem {
         Err(Error::NotFound)
     }
 
+    /// Set (create or replace) the extended attribute `name` with `value`
+    /// on the inode at `path`. `name` must carry a known namespace prefix
+    /// (e.g. `"user.com.apple.FinderInfo"`).
+    ///
+    /// v1 scope: **in-inode xattrs only.** If the in-inode region is too
+    /// small to hold the (new) entry, returns
+    /// `Error::NoSpaceLeftOnDevice` (ENOSPC). External xattr blocks are
+    /// not mutated; values that would need to spill there fail rather
+    /// than silently writing elsewhere.
+    pub fn apply_setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        let inode_size = self.sb.inode_size as usize;
+        let i_extra_isize = if raw.len() >= 0x82 {
+            u16::from_le_bytes(raw[0x80..0x82].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        let region_start = 128 + i_extra_isize;
+        let region_end = inode_size.min(raw.len());
+        if region_start + 8 > region_end {
+            // No space for even the magic + a terminator.
+            return Err(Error::NoSpaceLeftOnDevice);
+        }
+
+        let region = &mut raw[region_start..region_end];
+        crate::xattr::plan_set_in_inode_region(region, name, value)?;
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(ino, inode.generation, &raw)
+            {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(ino, &raw)?;
+        self.dev.flush()?;
+        Ok(())
+    }
+
     /// Set the access + modification times on `path`. Mirrors POSIX
     /// `utimensat(2)`: `atime_sec/nsec` and `mtime_sec/nsec` each replace
     /// the inode's atime/mtime. `ctime` is bumped to now (POSIX requires
