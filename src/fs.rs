@@ -779,12 +779,15 @@ impl Filesystem {
     /// with mode S_IFLNK, installs the target bytes, and adds a dir entry
     /// at the link path.
     ///
-    /// **Fast symlinks only for v1**: `target.len() <= 60`. Longer targets
-    /// need a data-block allocation like any regular file write, which is
-    /// doable but not landed yet — they return `Error::InvalidArgument`.
+    /// Two storage paths:
+    /// - **Fast symlink** (`target.len() <= 60`): target stored inline in
+    ///   the 60-byte `i_block` area; no data-block allocation.
+    /// - **Slow symlink** (`61..=255` bytes): one filesystem block is
+    ///   allocated and the target is written there, with an EXTENTS
+    ///   i_block pointing at it.
     ///
-    /// Returns the new inode number on success, errors on name conflicts,
-    /// missing parent, RO mount, target too long.
+    /// POSIX caps symlink targets at SYMLINK_MAX (255 bytes on Linux +
+    /// macOS). Longer returns `Error::NameTooLong` → ENAMETOOLONG.
     pub fn apply_symlink(&self, target: &str, linkpath: &str) -> Result<u32> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
@@ -792,10 +795,8 @@ impl Filesystem {
         if target.is_empty() {
             return Err(Error::InvalidArgument("symlink target is empty"));
         }
-        if target.len() > 60 {
-            return Err(Error::InvalidArgument(
-                "symlink target > 60 bytes (slow-symlink path not implemented)",
-            ));
+        if target.len() > 255 {
+            return Err(Error::NameTooLong);
         }
         let (parent_path, base_name) = split_parent_and_base(linkpath)?;
         if base_name.len() > 255 {
@@ -843,7 +844,39 @@ impl Filesystem {
         )?;
         self.patch_sb_counters(plan.sb.free_blocks_delta as i64, plan.sb.free_inodes_delta)?;
 
-        let raw = self.build_fast_symlink_inode(new_ino, target.as_bytes())?;
+        // Fast-symlink if target fits inline; otherwise allocate a block.
+        let raw = if target.len() <= 60 {
+            self.build_fast_symlink_inode(new_ino, target.as_bytes())?
+        } else {
+            let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
+                let mut buf = vec![0u8; bs as usize];
+                self.dev.read_at(block * bs as u64, &mut buf)?;
+                Ok(buf)
+            };
+            let bplan = crate::alloc::plan_block_allocation(
+                &self.sb,
+                &self.groups,
+                1,
+                parent_group,
+                &mut bitmap_reader,
+            )?;
+            let data_phys = bplan.first_block;
+
+            self.mark_block_run_used(data_phys, 1)?;
+            self.patch_bgd_counters(
+                bplan.bgd.group_idx as usize,
+                bplan.bgd.free_blocks_delta,
+                bplan.bgd.free_inodes_delta,
+                bplan.bgd.used_dirs_delta,
+            )?;
+            self.patch_sb_counters(bplan.sb.free_blocks_delta, bplan.sb.free_inodes_delta)?;
+
+            let mut block = vec![0u8; bs as usize];
+            block[..target.len()].copy_from_slice(target.as_bytes());
+            self.dev.write_at(data_phys * bs as u64, &block)?;
+
+            self.build_slow_symlink_inode(new_ino, target.as_bytes(), data_phys)?
+        };
         self.write_inode_raw(new_ino, &raw)?;
 
         // Install dir entry.
@@ -931,6 +964,79 @@ impl Filesystem {
         // i_block at 0x28..0x64: target bytes, zero-padded.
         let blk_off = 0x28;
         raw[blk_off..blk_off + target.len()].copy_from_slice(target);
+
+        let now = now_unix_seconds();
+        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
+        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
+        let generation =
+            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
+        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
+
+        if inode_size >= 0x82 + 2 {
+            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
+        }
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        Ok(raw)
+    }
+
+    /// Compose a slow-symlink inode image: `S_IFLNK | 0o777`, 1 link,
+    /// `i_size = target.len()`, EXTENTS flag set with a single-entry leaf
+    /// root pointing at `data_phys` (logical block 0, length 1). One fs
+    /// block worth of 512-byte sectors charged to `i_blocks`.
+    ///
+    /// Caller must have already written the target bytes (zero-padded) to
+    /// `data_phys * block_size`.
+    fn build_slow_symlink_inode(&self, ino: u32, target: &[u8], data_phys: u64) -> Result<Vec<u8>> {
+        debug_assert!(target.len() > 60 && target.len() <= 255);
+        let inode_size = self.sb.inode_size as usize;
+        let mut raw = vec![0u8; inode_size];
+
+        let mode_bits = crate::inode::S_IFLNK | 0o0777;
+        raw[0x00..0x02].copy_from_slice(&mode_bits.to_le_bytes());
+
+        // i_size (lo 32) = target length.
+        raw[0x04..0x08].copy_from_slice(&(target.len() as u32).to_le_bytes());
+
+        // i_links_count = 1.
+        raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
+
+        // i_blocks_lo = sectors consumed by the single data block.
+        let bs = self.sb.block_size() as u64;
+        let sectors = bs / 512;
+        raw[0x1C..0x20].copy_from_slice(&(sectors as u32).to_le_bytes());
+
+        // i_flags = EXTENTS.
+        let flags = crate::inode::InodeFlags::EXTENTS.bits();
+        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+
+        // i_block at 0x28..0x64: extent leaf header + one entry.
+        let eh_off = 0x28;
+        raw[eh_off..eh_off + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+        raw[eh_off + 2..eh_off + 4].copy_from_slice(&1u16.to_le_bytes()); // entries=1
+        raw[eh_off + 4..eh_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max=4
+        raw[eh_off + 6..eh_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth=0
+
+        // Single leaf extent at entry-slot index 1 (offset +12): logical=0,
+        // length=1, physical=data_phys.
+        let e_off = eh_off + 12;
+        raw[e_off..e_off + 4].copy_from_slice(&0u32.to_le_bytes()); // ee_block
+        raw[e_off + 4..e_off + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len
+        let phys_hi = ((data_phys >> 32) & 0xFFFF) as u16;
+        let phys_lo = (data_phys & 0xFFFF_FFFF) as u32;
+        raw[e_off + 6..e_off + 8].copy_from_slice(&phys_hi.to_le_bytes());
+        raw[e_off + 8..e_off + 12].copy_from_slice(&phys_lo.to_le_bytes());
 
         let now = now_unix_seconds();
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime

@@ -110,10 +110,59 @@ fn symlink_existing_path_returns_eexist() {
 }
 
 #[test]
-fn symlink_target_too_long_returns_einval() {
-    // 61 bytes — one over the fast-symlink limit.
-    let long_target = "x".repeat(61);
-    let img = scratch("long");
+fn symlink_slow_path_target_over_60_bytes_roundtrips() {
+    // Targets 61..=255 bytes go through the slow path: 1 block allocated,
+    // target written there, extent inserted into the inode.
+    let long_target = "/".to_string() + &"long_path_component/".repeat(8) + "leaf"; // ~164 bytes
+    assert!(long_target.len() > 60);
+    assert!(long_target.len() <= 255);
+
+    let img = scratch("slow");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let target_c = CString::new(long_target.as_str()).unwrap();
+    let link_c = CString::new("/slowlink").unwrap();
+
+    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    assert!(!fs_h.is_null());
+    let ino = unsafe { ext4rs_symlink(fs_h, target_c.as_ptr(), link_c.as_ptr()) };
+    assert!(ino > 0, "slow symlink creation failed");
+    assert_eq!(ext4rs_last_errno(), 0);
+
+    let attr = stat_attr(fs_h, "/slowlink");
+    assert!(matches!(attr.file_type, ext4rs_file_type_t::Symlink));
+    assert_eq!(attr.size, long_target.len() as u64);
+
+    let mut buf = [0u8; 512];
+    let rc =
+        unsafe { ext4rs_readlink(fs_h, link_c.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+    assert_eq!(rc, 0);
+    let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(&buf[..nul], long_target.as_bytes());
+
+    unsafe { ext4rs_umount(fs_h) };
+
+    // Persists across csum-validated remount.
+    let fs2 = unsafe { ext4rs_mount(img_c.as_ptr()) };
+    assert!(
+        !fs2.is_null(),
+        "remount failed — inode/extent csum not patched?"
+    );
+    let mut buf = [0u8; 512];
+    let rc =
+        unsafe { ext4rs_readlink(fs2, link_c.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+    assert_eq!(rc, 0);
+    let nul = buf.iter().position(|&b| b == 0).expect("NUL terminator");
+    assert_eq!(&buf[..nul], long_target.as_bytes());
+    unsafe { ext4rs_umount(fs2) };
+
+    let _ = fs::remove_file(&img);
+}
+
+#[test]
+fn symlink_target_over_255_returns_enametoolong() {
+    // 256 bytes — over POSIX SYMLINK_MAX.
+    let long_target = "x".repeat(256);
+    let img = scratch("toolong");
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let target_c = CString::new(long_target.clone()).unwrap();
     let link_c = CString::new("/toolong").unwrap();
@@ -122,7 +171,12 @@ fn symlink_target_too_long_returns_einval() {
     assert!(!fs_h.is_null());
     let ino = unsafe { ext4rs_symlink(fs_h, target_c.as_ptr(), link_c.as_ptr()) };
     assert_eq!(ino, 0);
-    assert_eq!(ext4rs_last_errno(), 22, "EINVAL expected for long target");
+    assert_eq!(
+        ext4rs_last_errno(),
+        63,
+        "ENAMETOOLONG expected (got {})",
+        ext4rs_last_errno()
+    );
     unsafe { ext4rs_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
