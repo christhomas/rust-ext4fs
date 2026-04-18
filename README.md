@@ -24,7 +24,9 @@ dependency itself — the library is portable Rust.
 | multi-level extent tree mutation (depth 0→1 promotion + depth-1 inserts) | done |
 | multi-level extent tree mutation (depth ≥2, leaf-block split) | **not supported** |
 | sparse grow via truncate | **not supported** |
-| setxattr, removexattr | **not supported** |
+| removexattr (in-inode) | done (via `ext4rs_removexattr`) |
+| setxattr | **not supported** |
+| removexattr on external xattr block | **not supported** |
 | chmod, chown, utimens | done (via `ext4rs_chmod` / `ext4rs_chown` / `ext4rs_utimens`) |
 | journaled transactions | partial (jbd2 replay; write path unjournaled) |
 
