@@ -137,6 +137,89 @@ fn extending_dir_past_four_noncontiguous_extents_triggers_promotion() {
 }
 
 #[test]
+fn directory_growth_continues_past_promotion() {
+    // Once a directory's extent tree promotes to depth 1, subsequent grows
+    // must mutate the leaf block (not the inline root). Regression: without
+    // the depth-1 insertion path, `plan_insert_extent` on the depth-1 inline
+    // root bails with `multi-level tree mutation not yet supported`, so any
+    // extra dir entry that required a fresh data block would fail.
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
+    let dev = FileDevice::open_rw(&path).expect("open rw");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
+    let bs = fs.sb.block_size() as u64;
+
+    let target = "/post_promo_dir";
+    fs.apply_mkdir(target, 0o755).expect("mkdir target");
+    create_until_promotion(&fs, target, 2000);
+
+    // Confirm we landed at depth 1.
+    let dir_ino = resolve(&fs, target).expect("resolve");
+    let (dir_inode, _) = fs.read_inode_verified(dir_ino).expect("read");
+    let hdr = ExtentHeader::parse(&dir_inode.block).expect("parse");
+    assert_eq!(hdr.depth, 1);
+    let size_at_promo = dir_inode.size;
+
+    // Fill the directory past promotion boundary until it grows by at least
+    // two more non-contiguous blocks (with gap files to prevent merge).
+    let mut post_extensions = 0;
+    let mut prev_size = size_at_promo;
+    let mut gap_counter = 0u32;
+    for i in 0..2500 {
+        let name = format!("{target}/post_{i:05}_extra.txt");
+        fs.apply_create(&name, 0o644)
+            .unwrap_or_else(|e| panic!("post-promotion create #{i}: {e}"));
+        let (di, _) = fs.read_inode_verified(dir_ino).expect("read");
+        if di.size > prev_size {
+            prev_size = di.size;
+            post_extensions += 1;
+            let gap = format!("/post_gap_{gap_counter:04}.bin");
+            gap_counter += 1;
+            fs.apply_create(&gap, 0o644).expect("create gap");
+            fs.apply_replace_file_content(&gap, &vec![0xCDu8; bs as usize])
+                .expect("write gap");
+            if post_extensions >= 2 {
+                break;
+            }
+        }
+    }
+    assert!(
+        post_extensions >= 2,
+        "expected at least 2 post-promotion extensions, got {post_extensions}"
+    );
+
+    // Tree should still be depth 1 (we haven't overflowed the leaf yet — the
+    // leaf has capacity for 340 entries on a 4 KiB block). The leaf's
+    // entry count must have grown.
+    let (dir_inode, _) = fs.read_inode_verified(dir_ino).expect("final read");
+    let hdr = ExtentHeader::parse(&dir_inode.block).expect("parse");
+    assert_eq!(hdr.depth, 1, "still at depth 1 after additional grows");
+    assert!(dir_inode.size > size_at_promo, "dir size grew");
+
+    drop(fs);
+    // Remount ro, confirm the depth-1 tree + newly-inserted leaf entries all
+    // resolve via the read-side lookup_verified + verify_extent_tail.
+    let dev = FileDevice::open(&path).expect("open ro");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("remount");
+    let dir_ino = resolve(&fs, target).expect("resolve");
+    let (dir_inode, _) = fs.read_inode_verified(dir_ino).expect("read");
+    let n_blocks = dir_inode.size.div_ceil(fs.sb.block_size() as u64);
+    for logical in 0..n_blocks {
+        let phys = ext4rs::extent::map_logical(
+            &dir_inode.block,
+            fs.dev.as_ref(),
+            fs.sb.block_size(),
+            logical,
+        )
+        .expect("map_logical through depth-1 leaf");
+        assert!(phys.is_some(), "logical {logical} resolves post-remount");
+    }
+
+    fs::remove_file(path).ok();
+}
+
+#[test]
 fn verified_read_survives_promotion() {
     // Tighter variant: pick one specific entry, confirm it resolves both
     // before the remount and after, to lock in that neither the write path

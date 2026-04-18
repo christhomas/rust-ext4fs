@@ -21,15 +21,17 @@ dependency itself — the library is portable Rust.
 | create, unlink, mkdir, rmdir | done |
 | rename (no-clobber, POSIX `EINVAL` into own subtree) | done |
 | hardlink, truncate (shrink), write file (replace body) | done |
-| multi-level extent tree mutation | **not supported** |
+| multi-level extent tree mutation (depth 0→1 promotion + depth-1 inserts) | done |
+| multi-level extent tree mutation (depth ≥2, leaf-block split) | **not supported** |
 | sparse grow via truncate | **not supported** |
 | setxattr, removexattr | **not supported** |
 | chmod, chown, utimens | **not supported** |
 | journaled transactions | partial (jbd2 replay; write path unjournaled) |
 
-Roughly a read/write driver for the common case. Large-file writes
-that cross a single extent-root worth of extents, or sparse-file
-extension, are the known gaps. POSIX errnos are mapped through
+Roughly a read/write driver for the common case. Directories that have
+been promoted to depth 1 can keep growing up to their leaf block's
+capacity (~340 extents on a 4 KiB block); beyond that, or for sparse-
+file extension, are the known gaps. POSIX errnos are mapped through
 (`ENOENT`, `ENOTDIR`, `EISDIR`, `EINVAL`, `EEXIST`, `ENOTEMPTY`,
 `EROFS`, `ENAMETOOLONG`, `ENOTSUP`).
 
