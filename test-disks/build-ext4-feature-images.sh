@@ -30,7 +30,15 @@ mkdir -p "$CACHE"
 # ---------------------------------------------------------------------------
 ALPINE_VER=3.21.4
 ALPINE_REL="${ALPINE_VER%.*}"
-ALPINE_BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/x86_64/netboot-${ALPINE_VER}"
+ALPINE_NETBOOT="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/x86_64/netboot-${ALPINE_VER}"
+ALPINE_ISO="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/x86_64/alpine-virt-${ALPINE_VER}-x86_64.iso"
+ALPINE_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main/x86_64"
+
+# Pinned package versions for attr + acl (not in the virt ISO's
+# embedded apk cache; downloaded separately and installed via
+# `apk add --allow-untrusted` from the 9p share after boot).
+ATTR_APK="attr-2.5.2-r2.apk"
+ACL_APK="acl-2.3.2-r1.apk"
 
 download_if_missing() {
     local url="$1" out="$2"
@@ -39,9 +47,13 @@ download_if_missing() {
         curl -fsSL -o "$out" "$url"
     fi
 }
-download_if_missing "$ALPINE_BASE/vmlinuz-virt"   "$CACHE/vmlinuz-virt"
-download_if_missing "$ALPINE_BASE/initramfs-virt" "$CACHE/initramfs-virt"
-download_if_missing "$ALPINE_BASE/modloop-virt"   "$CACHE/modloop-virt"
+download_if_missing "$ALPINE_NETBOOT/vmlinuz-virt"   "$CACHE/vmlinuz-virt"
+download_if_missing "$ALPINE_NETBOOT/initramfs-virt" "$CACHE/initramfs-virt"
+download_if_missing "$ALPINE_ISO"                    "$CACHE/alpine-virt.iso"
+
+mkdir -p "$CACHE/extra-apks"
+download_if_missing "$ALPINE_MAIN/$ATTR_APK" "$CACHE/extra-apks/$ATTR_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_APK"  "$CACHE/extra-apks/$ACL_APK"
 
 # ---------------------------------------------------------------------------
 # Step 2 — assemble the apkovl (Alpine overlay) that wires our guest
@@ -51,34 +63,25 @@ OVL_TMP="$CACHE/ovl"
 rm -rf "$OVL_TMP"
 mkdir -p "$OVL_TMP/etc/local.d" "$OVL_TMP/etc/runlevels/default" "$OVL_TMP/etc/apk"
 
-# /etc/apk/world — packages Alpine's diskless setup will install
-# during boot (via `apk add` after applying the overlay). These are
-# everything we need to run the mkfs/mount/xattr/acl commands.
+# /etc/apk/world — packages Alpine's diskless-init will install to
+# the new root before pivot. All available from the CDROM-backed
+# local repo /media/cdrom/apks (the alpine-virt ISO ships them).
+# attr + acl aren't in the virt ISO — those are installed later,
+# in the local.d wrapper, via `apk add --allow-untrusted` against
+# the .apk files we dropped on the 9p share.
 cat > "$OVL_TMP/etc/apk/world" <<'PKGS_EOF'
 alpine-base
 busybox
 e2fsprogs
 e2fsprogs-extra
-attr
-acl
 util-linux
 PKGS_EOF
 
-# Use HTTP (not HTTPS) for the apk mirror — qemu NAT DNS works,
-# but TLS handshake against dl-cdn has been flaky in the boot
-# environment. APK packages are signed independently of TLS.
-cat > "$OVL_TMP/etc/apk/repositories" <<REPO_EOF
-http://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main
-http://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/community
+# Single repo: the CDROM's local apk cache. Fully offline —
+# apk never hits the network during "Install packages to root".
+cat > "$OVL_TMP/etc/apk/repositories" <<'REPO_EOF'
+/media/cdrom/apks
 REPO_EOF
-
-# qemu's built-in DNS at 10.0.2.3 works but the guest's resolver
-# doesn't always detect it; pin public resolvers explicitly.
-cat > "$OVL_TMP/etc/resolv.conf" <<'DNS_EOF'
-nameserver 10.0.2.3
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-DNS_EOF
 
 # Wrapper that chains the real builder (which lives on the 9p host
 # share, so we don't bake it into the apkovl). Writes a done-marker
@@ -87,12 +90,19 @@ cat > "$OVL_TMP/etc/local.d/99-ext4.start" <<'WRAPPER_EOF'
 #!/bin/sh
 set -eu
 echo "[vm] local.d starting"
-# modules we need for 9p
+# Ensure 9p + loop modules are loaded (the virt kernel has most
+# built-in but modprobe is idempotent so it's safe either way).
 modprobe 9p 9pnet 9pnet_virtio 2>/dev/null || true
 modprobe loop 2>/dev/null || true
 
 mkdir -p /host
 mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host
+
+# Install the packages that weren't in the virt ISO's apk cache
+# (attr, acl) directly from the .apk files the host dropped on the
+# 9p share. --allow-untrusted because they aren't signed by a key
+# the VM's apk trusts (we downloaded them raw).
+apk add --no-network --allow-untrusted /host/.vm-cache/extra-apks/*.apk
 
 sh /host/_vm-builder.sh $(cat /host/.vm-cache/vm-args 2>/dev/null) \
         > /host/.vm-cache/vm-build.log 2>&1 \
@@ -138,7 +148,8 @@ printf '%s\n' "$@" > "$CACHE/vm-args"
 qemu-system-x86_64 \
     -kernel "$CACHE/vmlinuz-virt" \
     -initrd "$CACHE/initramfs-virt" \
-    -append "console=ttyS0 modules=loop,squashfs,sd-mod,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio ip=dhcp apkovl=http://10.0.2.2:${HTTP_PORT}/ovl.apkovl.tar.gz alpine_repo=http://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main modloop=http://10.0.2.2:${HTTP_PORT}/modloop-virt" \
+    -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio ip=dhcp apkovl=http://10.0.2.2:${HTTP_PORT}/ovl.apkovl.tar.gz" \
+    -drive file="$CACHE/alpine-virt.iso",media=cdrom,readonly=on \
     -virtfs local,path="$SCRIPT_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
     -m 1024 \
