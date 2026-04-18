@@ -2,18 +2,7 @@
 
 ## [Unreleased]
 
-### Added
-
-- Multi-level extent tree promotion (depth 0 → depth 1) in
-  `extent_mut`, with `Checksummer::patch_extent_tail` so newly
-  built leaf blocks carry a valid `ext4_extent_tail.et_checksum`.
-
-### Changed
-
-- Full `cargo fmt` sweep and `cargo clippy --all-targets -- -D warnings`
-  pass; CI now gates on fmt + clippy + test (`macos-14` + `ubuntu-latest`).
-- `CallbackDevice` fields migrated from inline `Box<dyn Fn(...) + Send + Sync>`
-  to `ReadCb` / `WriteCb` / `FlushCb` type aliases for readability.
+_Nothing yet._
 
 ## [0.1.0] — 2026-04-18
 
@@ -32,10 +21,25 @@ repo into a standalone crate.
   `ext4rs_rmdir`, `ext4rs_rename`, `ext4rs_link`, `ext4rs_write_file`,
   `ext4rs_truncate`.
 
+### Driver features
+
+- Multi-level extent tree promotion (depth 0 → depth 1) in
+  `extent_mut`, with `Checksummer::patch_extent_tail` so newly
+  built leaf blocks carry a valid `ext4_extent_tail.et_checksum`.
+
+### Build / CI
+
+- `cargo fmt` + `cargo clippy --all-targets -- -D warnings` gate on
+  CI (`ubuntu-latest`). `macos-14` temporarily dropped from the test
+  matrix pending a qemu-based test-disk generator (the docker-based
+  generator doesn't run on macOS CI).
+- `CallbackDevice` fields use `ReadCb` / `WriteCb` / `FlushCb` type
+  aliases instead of inline `Box<dyn Fn(...) + Send + Sync>`.
+
 ### Known gaps
 
-- Multi-level extent tree mutation not implemented; large / fragmented
-  writes will fail loudly.
+- Multi-level extent tree mutation beyond depth 1 not implemented;
+  very large / fragmented writes will fail loudly.
 - Sparse grow via truncate not implemented.
 - `setxattr`, `removexattr`, `chmod`, `chown`, `utimens` — not in the
   ABI; reads only for xattrs.
