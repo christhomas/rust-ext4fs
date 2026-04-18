@@ -298,11 +298,7 @@ pub enum SetOutcome {
 /// - `Error::NameTooLong` when the suffix is longer than 255 bytes.
 /// - `Error::NoSpaceLeftOnDevice` when the rewritten region wouldn't fit
 ///   (entries + values + 4-byte terminator > region capacity).
-pub fn plan_set_in_inode_region(
-    region: &mut [u8],
-    name: &str,
-    value: &[u8],
-) -> Result<SetOutcome> {
+pub fn plan_set_in_inode_region(region: &mut [u8], name: &str, value: &[u8]) -> Result<SetOutcome> {
     let Some((name_index, suffix)) = split_qualified_name(name) else {
         return Err(Error::InvalidArgument(
             "xattr name missing known namespace prefix",
