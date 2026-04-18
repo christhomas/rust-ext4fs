@@ -1,6 +1,21 @@
 # Changelog
 
-## [0.1.0] — unreleased
+## [Unreleased]
+
+### Added
+
+- Multi-level extent tree promotion (depth 0 → depth 1) in
+  `extent_mut`, with `Checksummer::patch_extent_tail` so newly
+  built leaf blocks carry a valid `ext4_extent_tail.et_checksum`.
+
+### Changed
+
+- Full `cargo fmt` sweep and `cargo clippy --all-targets -- -D warnings`
+  pass; CI now gates on fmt + clippy + test (`macos-14` + `ubuntu-latest`).
+- `CallbackDevice` fields migrated from inline `Box<dyn Fn(...) + Send + Sync>`
+  to `ReadCb` / `WriteCb` / `FlushCb` type aliases for readability.
+
+## [0.1.0] — 2026-04-18
 
 First public release. Extracted from the internal ext4-fskit research
 repo into a standalone crate.
@@ -26,9 +41,10 @@ repo into a standalone crate.
   ABI; reads only for xattrs.
 - Write path is unjournaled. `jbd2` replay works at mount for a
   cleanly-closed journal; live transactions are not yet wrapped.
+
 ### Origin
 
-- Imported from `github.com/christhomas/ext4-fskit@<commit>`.
+- Imported from `github.com/christhomas/ext4-fskit@aaa63cf`.
 - Previous C ABI name `ext4_bridge_*` renamed to `ext4rs_*` to match
   the crate identity and remove the "bridge" branding that referred
   back to the deprecated C/lwext4 shim.
