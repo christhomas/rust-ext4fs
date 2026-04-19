@@ -36,6 +36,7 @@ pub mod features;
 pub mod file_io;
 pub mod file_mut;
 pub mod fs;
+pub mod fsck;
 pub mod hash;
 pub mod htree;
 pub mod htree_mut;
