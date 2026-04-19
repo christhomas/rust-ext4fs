@@ -82,7 +82,11 @@ impl AuditReport {
 /// Capped by `max_dirs_visited` and `max_entries_per_dir` so a
 /// deliberately-cyclic or extremely large image can still be audited
 /// in bounded time. For a real fsck pass, set both to `u32::MAX`.
-pub fn audit(fs: &Filesystem, max_dirs_visited: u32, max_entries_per_dir: u32) -> Result<AuditReport> {
+pub fn audit(
+    fs: &Filesystem,
+    max_dirs_visited: u32,
+    max_entries_per_dir: u32,
+) -> Result<AuditReport> {
     // Observed: ino → reference-count.
     let mut observed: HashMap<u32, u32> = HashMap::new();
     let mut parent_claim: HashMap<u32, u32> = HashMap::new();
@@ -246,7 +250,9 @@ fn collect_dir_entries(
         return Ok(entries);
     }
     if !inode.has_extents() {
-        return Err(Error::Corrupt("legacy non-extent dirs not supported by audit"));
+        return Err(Error::Corrupt(
+            "legacy non-extent dirs not supported by audit",
+        ));
     }
     let total_blocks = inode.size.div_ceil(block_size as u64);
     let mut buf = vec![0u8; block_size as usize];

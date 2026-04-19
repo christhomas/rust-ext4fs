@@ -84,7 +84,8 @@ fn inline_read_respects_offset_and_length() {
     let path = CString::new("/medium.txt").unwrap();
 
     let mut buf = [0u8; 32];
-    let n = unsafe { fs_ext4_read_file(fs, path.as_ptr(), buf.as_mut_ptr() as *mut c_void, 50, 10) };
+    let n =
+        unsafe { fs_ext4_read_file(fs, path.as_ptr(), buf.as_mut_ptr() as *mut c_void, 50, 10) };
     assert_eq!(n, 10);
     assert!(buf[..10].iter().all(|&b| b == b'A'));
 

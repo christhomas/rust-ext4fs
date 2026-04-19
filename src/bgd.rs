@@ -150,7 +150,9 @@ pub fn locate_inode(
         return Err(Error::InvalidInode(ino));
     }
     if sb.inodes_per_group == 0 || sb.inode_size == 0 {
-        return Err(Error::Corrupt("superblock: zero inodes_per_group or inode_size"));
+        return Err(Error::Corrupt(
+            "superblock: zero inodes_per_group or inode_size",
+        ));
     }
     let group_idx = ((ino - 1) / sb.inodes_per_group) as usize;
     let local_idx = ((ino - 1) % sb.inodes_per_group) as u64;

@@ -67,7 +67,11 @@ fn unlink_directory_sets_eisdir() {
     let dir = CString::new("/subdir").unwrap();
     let rc = unsafe { fs_ext4_unlink(fs_handle, dir.as_ptr()) };
     assert_eq!(rc, -1);
-    assert_eq!(fs_ext4_last_errno(), 21, "expected EISDIR for unlink-on-dir");
+    assert_eq!(
+        fs_ext4_last_errno(),
+        21,
+        "expected EISDIR for unlink-on-dir"
+    );
     unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
 }

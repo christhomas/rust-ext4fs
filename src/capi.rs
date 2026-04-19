@@ -612,7 +612,9 @@ fn dir_entry_to_bridge(e: &dir::DirEntry) -> fs_ext4_dirent_t {
 
 /// Get the next dir entry. Returns NULL at end or on error.
 #[no_mangle]
-pub unsafe extern "C" fn fs_ext4_dir_next(iter: *mut fs_ext4_dir_iter_t) -> *const fs_ext4_dirent_t {
+pub unsafe extern "C" fn fs_ext4_dir_next(
+    iter: *mut fs_ext4_dir_iter_t,
+) -> *const fs_ext4_dirent_t {
     ffi_guard(
         std::ptr::null(),
         AssertUnwindSafe(|| {
@@ -1233,7 +1235,11 @@ pub unsafe extern "C" fn fs_ext4_rename(
 /// 12 bits used; file-type bits are set automatically). Returns the new
 /// directory's inode number on success, 0 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn fs_ext4_mkdir(fs: *mut fs_ext4_fs_t, path: *const c_char, mode: u16) -> u32 {
+pub unsafe extern "C" fn fs_ext4_mkdir(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    mode: u16,
+) -> u32 {
     ffi_guard(
         0u32,
         AssertUnwindSafe(|| {

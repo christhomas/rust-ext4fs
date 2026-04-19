@@ -239,8 +239,14 @@ fn link_null_inputs_do_not_crash() {
         unsafe { fs_ext4_link(std::ptr::null_mut(), s.as_ptr(), d.as_ptr()) },
         -1
     );
-    assert_eq!(unsafe { fs_ext4_link(fs, std::ptr::null(), d.as_ptr()) }, -1);
-    assert_eq!(unsafe { fs_ext4_link(fs, s.as_ptr(), std::ptr::null()) }, -1);
+    assert_eq!(
+        unsafe { fs_ext4_link(fs, std::ptr::null(), d.as_ptr()) },
+        -1
+    );
+    assert_eq!(
+        unsafe { fs_ext4_link(fs, s.as_ptr(), std::ptr::null()) },
+        -1
+    );
 
     unsafe { fs_ext4_umount(fs) };
     std::fs::remove_file(&img).ok();

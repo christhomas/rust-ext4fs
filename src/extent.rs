@@ -276,12 +276,12 @@ pub fn lookup_verified(
 
         // Read the child block, parse its header, continue loop.
         let mut buf = vec![0u8; block_size as usize];
-        let child_offset = idx
-            .leaf_block
-            .checked_mul(block_size as u64)
-            .ok_or(Error::CorruptExtentTree(
-                "extent index: child block offset overflow",
-            ))?;
+        let child_offset =
+            idx.leaf_block
+                .checked_mul(block_size as u64)
+                .ok_or(Error::CorruptExtentTree(
+                    "extent index: child block offset overflow",
+                ))?;
         dev.read_at(child_offset, &mut buf)?;
         if let Some(c) = ctx {
             if c.active() && !c.csum.verify_extent_tail(c.ino, c.generation, &buf) {
@@ -330,12 +330,12 @@ fn walk(
         }
         let idx = ExtentIdx::parse(&node[off..off + EXT4_EXT_NODE_SIZE])?;
         let mut buf = vec![0u8; block_size as usize];
-        let child_offset = idx
-            .leaf_block
-            .checked_mul(block_size as u64)
-            .ok_or(Error::CorruptExtentTree(
-                "extent walk: child block offset overflow",
-            ))?;
+        let child_offset =
+            idx.leaf_block
+                .checked_mul(block_size as u64)
+                .ok_or(Error::CorruptExtentTree(
+                    "extent walk: child block offset overflow",
+                ))?;
         dev.read_at(child_offset, &mut buf)?;
         let child_header = ExtentHeader::parse(&buf)?;
         walk(&buf, &child_header, dev, block_size, out)?;

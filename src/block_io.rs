@@ -435,7 +435,11 @@ mod tests {
         dev.read_at(0, &mut buf).unwrap();
         dev.read_at(0, &mut buf).unwrap();
 
-        assert_eq!(*inner.read_calls.lock().unwrap(), 1, "cache should absorb repeats");
+        assert_eq!(
+            *inner.read_calls.lock().unwrap(),
+            1,
+            "cache should absorb repeats"
+        );
         let (hits, misses) = dev.stats();
         assert_eq!((hits, misses), (2, 1));
     }
