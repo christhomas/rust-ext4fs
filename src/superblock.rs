@@ -120,6 +120,30 @@ impl Superblock {
         let checksum_seed = u32::from_le_bytes(raw[0x270..0x274].try_into().unwrap());
         let journal_inode = u32::from_le_bytes(raw[0xE0..0xE4].try_into().unwrap());
 
+        // Reject impossible geometry early so downstream arithmetic never
+        // divides by zero. All three are required for the filesystem to
+        // name even a single block or inode.
+        if blocks_per_group == 0 {
+            return Err(Error::Corrupt("superblock: blocks_per_group == 0"));
+        }
+        if inodes_per_group == 0 {
+            return Err(Error::Corrupt("superblock: inodes_per_group == 0"));
+        }
+        if inode_size == 0 {
+            return Err(Error::Corrupt("superblock: inode_size == 0"));
+        }
+        // log_block_size above 20 would produce a 1 GiB block — spec allows up
+        // to 64 KiB, anything larger is certainly a corrupt field. Guard here
+        // so `1024 << log_block_size` does not overflow u32 later.
+        if log_block_size > 20 {
+            return Err(Error::Corrupt(
+                "superblock: log_block_size exceeds sane maximum",
+            ));
+        }
+        if blocks_count == 0 {
+            return Err(Error::Corrupt("superblock: blocks_count == 0"));
+        }
+
         Ok(Self {
             inodes_count,
             blocks_count,

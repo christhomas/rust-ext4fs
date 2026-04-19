@@ -90,8 +90,11 @@ impl Filesystem {
     /// Read a whole block by its logical block number.
     pub fn read_block(&self, block_num: u64) -> Result<Vec<u8>> {
         let block_size = self.sb.block_size() as usize;
+        let byte_offset = block_num
+            .checked_mul(block_size as u64)
+            .ok_or(Error::Corrupt("block byte offset overflow"))?;
         let mut buf = vec![0u8; block_size];
-        self.dev.read_at(block_num * block_size as u64, &mut buf)?;
+        self.dev.read_at(byte_offset, &mut buf)?;
         Ok(buf)
     }
 
@@ -101,7 +104,13 @@ impl Filesystem {
         let block_data = self.read_block(block)?;
         let inode_size = self.sb.inode_size as usize;
         let off = offset as usize;
-        Ok(block_data[off..off + inode_size].to_vec())
+        let end = off
+            .checked_add(inode_size)
+            .ok_or(Error::Corrupt("inode slice end overflows usize"))?;
+        if end > block_data.len() {
+            return Err(Error::Corrupt("inode slice exceeds block data"));
+        }
+        Ok(block_data[off..end].to_vec())
     }
 
     /// Read + parse + checksum-verify an inode in one shot.

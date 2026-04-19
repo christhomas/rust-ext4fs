@@ -149,15 +149,33 @@ pub fn locate_inode(
     if ino == 0 || ino > sb.inodes_count {
         return Err(Error::InvalidInode(ino));
     }
+    if sb.inodes_per_group == 0 || sb.inode_size == 0 {
+        return Err(Error::Corrupt("superblock: zero inodes_per_group or inode_size"));
+    }
     let group_idx = ((ino - 1) / sb.inodes_per_group) as usize;
     let local_idx = ((ino - 1) % sb.inodes_per_group) as u64;
 
     let bgd = groups.get(group_idx).ok_or(Error::InvalidInode(ino))?;
     let block_size = sb.block_size() as u64;
-    let inodes_per_block = block_size / sb.inode_size as u64;
+    let inode_size = sb.inode_size as u64;
+    if inode_size > block_size {
+        return Err(Error::Corrupt(
+            "superblock: inode_size larger than block_size",
+        ));
+    }
+    let inodes_per_block = block_size / inode_size;
+    if inodes_per_block == 0 {
+        return Err(Error::Corrupt("superblock: inode_size exceeds block_size"));
+    }
 
-    let block = bgd.inode_table + (local_idx / inodes_per_block);
-    let offset_in_block = ((local_idx % inodes_per_block) * sb.inode_size as u64) as u32;
+    let block = bgd
+        .inode_table
+        .checked_add(local_idx / inodes_per_block)
+        .ok_or(Error::Corrupt("inode table block number overflow"))?;
+    let off_bytes = (local_idx % inodes_per_block) * inode_size;
+    let offset_in_block: u32 = off_bytes
+        .try_into()
+        .map_err(|_| Error::Corrupt("inode offset exceeds u32"))?;
 
     Ok((block, offset_in_block))
 }
