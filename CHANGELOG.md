@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.1.2] — 2026-04-20
+
+### ABI additions
+
+- `fs_ext4_volume_info_t` gained a trailing `uint8_t mounted_dirty`
+  field. `1` means the filesystem was not cleanly unmounted last time
+  it was used (captured from the on-disk `s_state` superblock field at
+  mount time); `0` means clean. Callers can surface this to the user
+  and run fsck / journal replay before permitting writes. Existing
+  consumers compiled against 0.1.1 remain source-compatible — the new
+  field is appended and initialised to 0 via the existing struct-zero
+  path in `fs_ext4_get_volume_info`.
+
+### Rust API additions
+
+- `Superblock` now parses `s_state` into a new `state: u16` field and
+  exposes `Superblock::is_clean()`. New constants `EXT4_VALID_FS` and
+  `EXT4_ERROR_FS` mirror the kernel's `s_state` bits.
+
+### Tests
+
+- `tests/capi_basic.rs::volume_info_flags_dirty_image` flips `s_state`
+  on a copy of the no-csum fixture and asserts the ABI surfaces
+  `mounted_dirty == 1`. `volume_info_reports_expected_fields` now also
+  asserts `mounted_dirty == 0` for the freshly-built clean fixture.
+
 ## [0.1.1] — 2026-04-20
 
 ### Docs / packaging

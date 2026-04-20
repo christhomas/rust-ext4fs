@@ -66,6 +66,14 @@ typedef struct {
     uint64_t free_blocks;
     uint32_t total_inodes;
     uint32_t free_inodes;
+    /*
+     * 1 if the filesystem was NOT cleanly unmounted last time it was used
+     * (captured from the on-disk s_state field at mount time, before any
+     * journal replay the driver may perform). 0 if clean. Consumers should
+     * surface a dirty value to the user and run fsck / journal replay
+     * before permitting writes.
+     */
+    uint8_t  mounted_dirty;
 } fs_ext4_volume_info_t;
 
 /* ---- Block device callback interface ---- */

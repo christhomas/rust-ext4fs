@@ -55,8 +55,54 @@ fn volume_info_reports_expected_fields() {
     assert_eq!(info.block_size, 4096, "expected 4KB blocks");
     assert!(info.total_blocks > 0, "total_blocks should be > 0");
     assert!(info.total_inodes > 0, "total_inodes should be > 0");
+    // A freshly-mkfs'd image that has not been mounted writably is
+    // clean — s_state == EXT4_VALID_FS → mounted_dirty == 0.
+    assert_eq!(info.mounted_dirty, 0, "fresh image should be clean");
 
     unsafe { fs_ext4_umount(fs) };
+}
+
+#[test]
+fn volume_info_flags_dirty_image() {
+    // Clone a no-csum image (so we can patch s_state without
+    // recomputing the superblock CRC32C), stamp s_state=0 into the
+    // copy, and verify the driver surfaces mounted_dirty=1. This
+    // exercises superblock parse → Filesystem.sb → fs_ext4_get_volume_info.
+    use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-no-csum.img");
+    let tmp = std::env::temp_dir().join("fs_ext4-dirty-fixture.img");
+    fs::copy(src, &tmp).expect("copy no-csum image");
+
+    // `s_state` lives at superblock byte offset 0x3A → file offset 1024+0x3A.
+    {
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)
+            .expect("open copy rw");
+        f.seek(SeekFrom::Start(1024 + 0x3A)).unwrap();
+        let mut cur = [0u8; 2];
+        f.read_exact(&mut cur).unwrap();
+        // Current must be clean (==1) so the test remains meaningful.
+        assert_eq!(u16::from_le_bytes(cur), 1, "fixture preconditions");
+        f.seek(SeekFrom::Start(1024 + 0x3A)).unwrap();
+        f.write_all(&0u16.to_le_bytes()).unwrap();
+    }
+
+    let path = CString::new(tmp.to_str().unwrap()).unwrap();
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
+    assert!(
+        !fs.is_null(),
+        "dirty image should still mount read-only: {}",
+        last_err_str()
+    );
+    let mut info = unsafe { std::mem::zeroed::<fs_ext4_volume_info_t>() };
+    let rc = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
+    assert_eq!(rc, 0, "get_volume_info on dirty fs failed");
+    assert_eq!(info.mounted_dirty, 1, "flipped s_state should surface as dirty");
+    unsafe { fs_ext4_umount(fs) };
+    fs::remove_file(&tmp).ok();
 }
 
 #[test]

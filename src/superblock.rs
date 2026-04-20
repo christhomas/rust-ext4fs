@@ -10,6 +10,14 @@ pub const SUPERBLOCK_OFFSET: u64 = 1024;
 pub const SUPERBLOCK_SIZE: usize = 1024;
 pub const EXT4_MAGIC: u16 = 0xEF53;
 
+/// `s_state` bits (byte offset 0x3A). The kernel sets `VALID_FS` when a
+/// clean unmount completes and clears it on mount; a dirty value on a
+/// not-currently-mounted image therefore indicates an unclean shutdown
+/// and signals the caller that journal replay (or `fsck`) is required
+/// before writes are safe.
+pub const EXT4_VALID_FS: u16 = 0x0001;
+pub const EXT4_ERROR_FS: u16 = 0x0002;
+
 /// Parsed in-memory representation of the ext4 superblock.
 /// Field names mirror the kernel's `struct ext4_super_block` (s_ prefix dropped).
 #[derive(Debug, Clone)]
@@ -23,6 +31,10 @@ pub struct Superblock {
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub magic: u16,
+    /// `s_state` (0x3A). `EXT4_VALID_FS` = cleanly unmounted. Any other
+    /// value means the FS was mounted and not cleanly unmounted (dirty)
+    /// or that the kernel marked the FS as having errors.
+    pub state: u16,
     pub rev_level: u32,
     pub inode_size: u16,
     pub feature_compat: u32,
@@ -67,6 +79,7 @@ impl Superblock {
         let log_block_size = u32::from_le_bytes(raw[0x18..0x1C].try_into().unwrap());
         let blocks_per_group = u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap());
         let inodes_per_group = u32::from_le_bytes(raw[0x28..0x2C].try_into().unwrap());
+        let state = u16::from_le_bytes(raw[0x3A..0x3C].try_into().unwrap());
         let rev_level = u32::from_le_bytes(raw[0x4C..0x50].try_into().unwrap());
 
         // Dynamic-rev fields (rev_level >= 1)
@@ -167,7 +180,18 @@ impl Superblock {
             checksum_seed,
             journal_inode,
             raw,
+            state,
         })
+    }
+
+    /// Whether the filesystem was cleanly unmounted. `false` here means
+    /// the FS was not cleanly unmounted and a journal replay (or fsck)
+    /// is required before writes are safe. Read-only consumers can
+    /// still mount a dirty FS; callers that intend to write should
+    /// surface this to the user and either run fsck or refuse to
+    /// mount read-write.
+    pub fn is_clean(&self) -> bool {
+        self.state & EXT4_VALID_FS != 0
     }
 
     /// Block size in bytes: 1024 << log_block_size.

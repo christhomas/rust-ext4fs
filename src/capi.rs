@@ -190,6 +190,12 @@ pub struct fs_ext4_volume_info_t {
     pub free_blocks: u64,
     pub total_inodes: u32,
     pub free_inodes: u32,
+    /// `1` if the filesystem was NOT cleanly unmounted last time it was
+    /// used (dirty) — the caller should surface this to the user and
+    /// run fsck / journal replay before permitting writes. `0` if the
+    /// filesystem is clean. Captured from the on-disk `s_state` field
+    /// at mount time, before any journal replay the driver may perform.
+    pub mounted_dirty: u8,
 }
 
 /// Block device read callback (matches `fs_ext4_read_fn`).
@@ -416,6 +422,7 @@ pub unsafe extern "C" fn fs_ext4_get_volume_info(
             info.free_blocks = fs.sb.free_blocks_count;
             info.total_inodes = fs.sb.inodes_count;
             info.free_inodes = fs.sb.free_inodes_count;
+            info.mounted_dirty = if fs.sb.is_clean() { 0 } else { 1 };
 
             0
         }),
