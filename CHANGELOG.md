@@ -1,6 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.1] — 2026-04-20
+
+### Docs / packaging
+
+- README fully rewritten. New sections: origins, a concrete
+  capability matrix contrasting ext4rs with its research references
+  (`yuoo655/ext4_rs` and `lwext4`) to justify this crate's existence
+  as an independent FFI-first implementation, and a plain-English
+  at-your-own-risk disclaimer restating the MIT no-warranty clause.
+- Framing neutralised: crate is described as a general-purpose FFI
+  ext4 driver. DiskJockey is mentioned once as a production user
+  with an explicit no-coupling note; no more `Swift` / `FSKit`-
+  specific language in the API description.
+- `Cargo.toml` description updated to match (`FFI from C/C++/Go/etc.`
+  instead of `Swift/C/Go/etc.`) and `version` bumped to `0.1.1`.
 
 ### Safety / robustness
 

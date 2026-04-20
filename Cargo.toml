@@ -1,9 +1,9 @@
 [package]
 name = "fs-ext4"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
-description = "Pure-Rust ext4 filesystem driver. Exposes a C ABI (fs_ext4_*) suitable for FFI from Swift/C/Go/etc."
+description = "Pure-Rust ext4 filesystem driver. Exposes a C ABI (fs_ext4_*) suitable for FFI from C/C++/Go/etc."
 repository = "https://github.com/christhomas/rust-fs-ext4"
 
 [lib]
