@@ -100,7 +100,10 @@ fn volume_info_flags_dirty_image() {
     let mut info = unsafe { std::mem::zeroed::<fs_ext4_volume_info_t>() };
     let rc = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
     assert_eq!(rc, 0, "get_volume_info on dirty fs failed");
-    assert_eq!(info.mounted_dirty, 1, "flipped s_state should surface as dirty");
+    assert_eq!(
+        info.mounted_dirty, 1,
+        "flipped s_state should surface as dirty"
+    );
     unsafe { fs_ext4_umount(fs) };
     fs::remove_file(&tmp).ok();
 }
