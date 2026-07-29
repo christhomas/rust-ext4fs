@@ -12,11 +12,17 @@ gg_have_gh || { echo "github-guard: gh not installed/authed — skipping merge-s
 owner=${slug%%/*}
 gg_user_owns "$owner" || exit 0
 
-# Reconcile the FULL desired state — no merge commits, squash + rebase allowed —
-# whenever ANY of the three differ. Reading only allow_merge_commit missed the
-# common case of a repo that already has merge commits off but still disallows
-# squash (e.g. rebase-only): the old check saw merge_commit=false and skipped,
-# leaving squash disabled so `gh pr merge --squash` failed.
+# Reconcile the FULL desired state — SQUASH ONLY — whenever any of the three
+# differ. Reading only allow_merge_commit missed the common case of a repo that
+# already has merge commits off but still disallows squash (e.g. rebase-only): the
+# old check saw merge_commit=false and skipped, leaving squash disabled so
+# `gh pr merge --squash` failed.
+#
+# Rebase is off, not merely unused. This guard used to ENFORCE rebase=true, so a
+# repo set to squash-only was silently switched back on the next commit. One commit
+# per pull request is the point: a branch's work-in-progress history is noise once
+# it lands, and the squash message is written deliberately rather than composed by
+# GitHub from whatever the commits happened to say.
 set -- $(gh api "repos/$slug" \
   --jq '"\(.allow_merge_commit) \(.allow_squash_merge) \(.allow_rebase_merge)"' 2>/dev/null)
 mc=${1:-} sq=${2:-} rb=${3:-}
@@ -30,10 +36,10 @@ for v in "$mc" "$sq" "$rb"; do
   esac
 done
 
-if [ "$mc" != "false" ] || [ "$sq" != "true" ] || [ "$rb" != "true" ]; then
-  echo "github-guard: $slug merge settings (merge=$mc squash=$sq rebase=$rb) — reconciling to squash+rebase only…" >&2
+if [ "$mc" != "false" ] || [ "$sq" != "true" ] || [ "$rb" != "false" ]; then
+  echo "github-guard: $slug merge settings (merge=$mc squash=$sq rebase=$rb) — reconciling to squash only…" >&2
   if gh api -X PATCH "repos/$slug" \
-       -F allow_merge_commit=false -F allow_squash_merge=true -F allow_rebase_merge=true \
+       -F allow_merge_commit=false -F allow_squash_merge=true -F allow_rebase_merge=false \
        >/dev/null 2>&1; then
     echo "github-guard: $slug merge settings fixed ✓" >&2
   else
