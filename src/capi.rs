@@ -1094,7 +1094,7 @@ fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<fs_ext4_dir
 
 /// Convert a parsed DirEntry to the C ABI dirent struct.
 fn dir_entry_to_bridge(e: &dir::DirEntry) -> fs_ext4_dirent_t {
-    let mut name = [0i8; 256];
+    let mut name = [0 as c_char; 256];
     let copy_len = e.name.len().min(255);
     for (i, &b) in e.name[..copy_len].iter().enumerate() {
         name[i] = b as c_char;
