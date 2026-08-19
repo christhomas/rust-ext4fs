@@ -646,7 +646,7 @@ fn format_block_groups(
 /// True if block group `g` carries a superblock + GDT backup under the classic
 /// RO_COMPAT_SPARSE_SUPER rule: group 0, group 1, and every power of 3, 5, or
 /// 7. Mirrors the kernel's / e2fsprogs' `ext4_bg_has_super`.
-fn group_has_super(g: u64) -> bool {
+pub(crate) fn group_has_super(g: u64) -> bool {
     fn is_power_of(mut g: u64, base: u64) -> bool {
         while g.is_multiple_of(base) {
             g /= base;
