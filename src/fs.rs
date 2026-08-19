@@ -219,6 +219,14 @@ struct NewInodePlan {
     base_name: String,
 }
 
+/// Which BGD "uninit" flag a bitmap-marking call is about — see
+/// `Filesystem::clear_bgd_uninit_flag_if_set`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BgdUninitFlag {
+    Inode,
+    Block,
+}
+
 impl Filesystem {
     /// Mount the ext4 filesystem on `dev`. Read-only unless the device reports
     /// `is_writable()`, in which case a dirty journal is replayed before
@@ -1078,12 +1086,66 @@ impl Filesystem {
 
     /// Buffer-side equivalent of `mark_block_run_used`: sets the bitmap
     /// bits for `[start, start+len)` in the buffer's bitmap block.
+    /// If group `gi`'s BGD has the given uninit flag set, clear it in `buf`
+    /// and return `true` (the caller must then zero the bitmap block
+    /// itself — the flag being set is precisely the license callers had to
+    /// leave that block's on-disk content unspecified). Returns `false`,
+    /// no-op, if the flag was already clear.
+    fn clear_bgd_uninit_flag_if_set(
+        &self,
+        buf: &mut BlockBuffer,
+        gi: usize,
+        which: BgdUninitFlag,
+    ) -> Result<bool> {
+        const INODE_UNINIT: u16 = 0x0001;
+        const BLOCK_UNINIT: u16 = 0x0002;
+        let flag = match which {
+            BgdUninitFlag::Inode => INODE_UNINIT,
+            BgdUninitFlag::Block => BLOCK_UNINIT,
+        };
+
+        let bs = self.sb.block_size() as u64;
+        let desc_size = self.sb.desc_size as u64;
+        let bgt_first_block = self.sb.first_data_block as u64 + 1;
+        let byte_in_bgt = gi as u64 * desc_size;
+        let bgt_block = bgt_first_block + byte_in_bgt / bs;
+        let off = (byte_in_bgt % bs) as usize;
+
+        let block = buf.get_mut(self, bgt_block)?;
+        let flags_off = off + 0x12;
+        let flags = u16::from_le_bytes(block[flags_off..flags_off + 2].try_into().unwrap());
+        if flags & flag == 0 {
+            return Ok(false);
+        }
+        let new_flags = flags & !flag;
+        block[flags_off..flags_off + 2].copy_from_slice(&new_flags.to_le_bytes());
+        Ok(true)
+    }
+
     pub(crate) fn buffer_mark_block_run_used(
         &self,
         buf: &mut BlockBuffer,
         start: u64,
         len: u64,
     ) -> Result<()> {
+        // NOTE: unlike `buffer_mark_inode_used`, this deliberately does NOT
+        // clear BLOCK_UNINIT (see `clear_bgd_uninit_flag_if_set`) even
+        // though the same staleness risk exists for the block bitmap.
+        // Doing that safely requires also marking this group's own
+        // metadata blocks (its bitmaps, inode table, and — depending on
+        // flex_bg placement — a possible superblock/GDT backup) as used
+        // *before* flipping the flag, since an uninit block bitmap isn't
+        // "all blocks genuinely free", it's "the reader must compute the
+        // group's own overhead analytically instead of trusting the
+        // on-disk bitmap". Getting that placement computation wrong on a
+        // flex_bg filesystem (where a group's bitmap/inode-table blocks
+        // can physically live in an *earlier* group of the same flex
+        // group) would silently hand out a block that's already part of
+        // the filesystem's own metadata — worse than the accounting drift
+        // this leaves behind (`e2fsck -fy` already reconciles
+        // free-block-count / block-bitmap mismatches with no data loss,
+        // matching the low-severity, self-healing bug this project's
+        // phase-3 spike already documented for the metadata_csum case).
         let bpg = self.sb.blocks_per_group as u64;
         let first_data = self.sb.first_data_block as u64;
         let gi = ((start - first_data) / bpg) as usize;
@@ -1202,7 +1264,28 @@ impl Filesystem {
         }
         let bit = ((ino - 1) % ipg) as u64;
         let bitmap_block = self.groups[gi].inode_bitmap;
+
+        // If this group's inode bitmap is still INODE_UNINIT, every reader
+        // (including a future mount of this same filesystem) is required to
+        // ignore whatever bytes are actually on disk there and assume the
+        // whole group is free — that's the entire point of the flag, and
+        // it's why uninit groups' bitmap blocks are allowed to contain
+        // stale/unspecified garbage from mkfs. The moment we allocate a
+        // real inode out of such a group, that assumption becomes false, so
+        // we must (a) zero the block ourselves before setting our bit —
+        // group index > 0 has zero pre-reserved inodes, so "everything but
+        // our bit is free" is exactly correct here — and (b) clear the
+        // flag. Skipping either step means the *next* mount still treats
+        // the group as empty and hands out the same inode number again,
+        // silently overwriting whatever was just written here. Found by
+        // hand: creating a file/directory whose parent lands in a
+        // previously-untouched group corrupted the parent on the very next
+        // allocation, every time, until this was fixed.
+        let was_uninit = self.clear_bgd_uninit_flag_if_set(buf, gi, BgdUninitFlag::Inode)?;
         let bm = buf.get_mut(self, bitmap_block)?;
+        if was_uninit {
+            bm.iter_mut().for_each(|byte| *byte = 0);
+        }
         let byte = (bit / 8) as usize;
         let mask = 1u8 << (bit % 8);
         if byte < bm.len() {
