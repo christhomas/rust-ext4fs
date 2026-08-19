@@ -6,6 +6,7 @@ use crate::checksum::Checksummer;
 use crate::error::{Error, Result};
 use crate::features;
 use crate::inode::Inode;
+use crate::mkfs::group_has_super;
 use crate::superblock::Superblock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1128,24 +1129,6 @@ impl Filesystem {
         start: u64,
         len: u64,
     ) -> Result<()> {
-        // NOTE: unlike `buffer_mark_inode_used`, this deliberately does NOT
-        // clear BLOCK_UNINIT (see `clear_bgd_uninit_flag_if_set`) even
-        // though the same staleness risk exists for the block bitmap.
-        // Doing that safely requires also marking this group's own
-        // metadata blocks (its bitmaps, inode table, and — depending on
-        // flex_bg placement — a possible superblock/GDT backup) as used
-        // *before* flipping the flag, since an uninit block bitmap isn't
-        // "all blocks genuinely free", it's "the reader must compute the
-        // group's own overhead analytically instead of trusting the
-        // on-disk bitmap". Getting that placement computation wrong on a
-        // flex_bg filesystem (where a group's bitmap/inode-table blocks
-        // can physically live in an *earlier* group of the same flex
-        // group) would silently hand out a block that's already part of
-        // the filesystem's own metadata — worse than the accounting drift
-        // this leaves behind (`e2fsck -fy` already reconciles
-        // free-block-count / block-bitmap mismatches with no data loss,
-        // matching the low-severity, self-healing bug this project's
-        // phase-3 spike already documented for the metadata_csum case).
         let bpg = self.sb.blocks_per_group as u64;
         let first_data = self.sb.first_data_block as u64;
         let gi = ((start - first_data) / bpg) as usize;
@@ -1154,8 +1137,48 @@ impl Filesystem {
         }
         let group_start = first_data + gi as u64 * bpg;
         let bit_start = (start - group_start) as u32;
+
+        // Same staleness problem as `buffer_mark_inode_used`, for the block
+        // bitmap this time: BLOCK_UNINIT is every reader's license to skip
+        // the on-disk bitmap and treat the group as empty, so the *next*
+        // mount kept proposing the same "first free" block for every new
+        // allocation into this group — including a file's own data block
+        // landing on top of a directory's just-created data block in the
+        // same group. Reproduced by hand: the second file written into a
+        // freshly-created directory corrupted the directory's own data
+        // block ("corrupt directory entry: bad rec_len during add") because
+        // its content block silently reused the directory's block number.
+        //
+        // Unlike an uninit inode bitmap, "all blocks free" isn't quite
+        // right here: a BLOCK_UNINIT group still owns whatever fixed
+        // overhead the classic RO_COMPAT_SPARSE_SUPER rule gives it (a
+        // superblock + GDT backup in groups 0, 1, and powers of 3/5/7) —
+        // those physically live in the group even though flex_bg moved the
+        // bitmap/inode-table blocks themselves to their flex cohort's head
+        // group. A group is only left BLOCK_UNINIT in the first place when
+        // mkfs never had to populate real bitmap/table data for it, which
+        // under flex_bg means it's never that head group — so the
+        // sparse_super backup is the *only* per-group reservation that can
+        // apply here, and it's the only one this accounts for.
+        let was_uninit = self.clear_bgd_uninit_flag_if_set(buf, gi, BgdUninitFlag::Block)?;
         let bitmap_block = self.groups[gi].block_bitmap;
         let bm = buf.get_mut(self, bitmap_block)?;
+        if was_uninit {
+            bm.iter_mut().for_each(|byte| *byte = 0);
+            if group_has_super(gi as u64) {
+                let desc_size = self.sb.desc_size as u64;
+                let bs = self.sb.block_size() as u64;
+                let gdt_blocks = (self.groups.len() as u64 * desc_size).div_ceil(bs);
+                let reserved = 1 + gdt_blocks; // superblock backup + GDT backup
+                for bit in 0..reserved.min(bpg) {
+                    let byte = (bit / 8) as usize;
+                    let mask = 1u8 << (bit % 8);
+                    if byte < bm.len() {
+                        bm[byte] |= mask;
+                    }
+                }
+            }
+        }
         for i in 0..len {
             let bit = bit_start as u64 + i;
             let byte = (bit / 8) as usize;
@@ -1285,6 +1308,19 @@ impl Filesystem {
         let bm = buf.get_mut(self, bitmap_block)?;
         if was_uninit {
             bm.iter_mut().for_each(|byte| *byte = 0);
+            // e2fsck convention: bits beyond `inodes_per_group`, up to the
+            // end of the bitmap block, represent no real inode and must
+            // read as 1 ("in use"), not 0 ("free") — that's what "padding
+            // at end of inode bitmap is not set" flags otherwise. Harmless
+            // on its own (no inode ever maps there), but worth getting
+            // right since we're already the one deciding this block's
+            // entire content for the first time.
+            let bits_per_block = (bm.len() as u64) * 8;
+            for pad_bit in (ipg as u64)..bits_per_block {
+                let byte = (pad_bit / 8) as usize;
+                let mask = 1u8 << (pad_bit % 8);
+                bm[byte] |= mask;
+            }
         }
         let byte = (bit / 8) as usize;
         let mask = 1u8 << (bit % 8);
