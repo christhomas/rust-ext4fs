@@ -38,7 +38,10 @@ fn last_err() -> String {
 fn raw_non_utf8_cstr() -> Vec<c_char> {
     // Bytes: 0xFF 0xFE (invalid UTF-8) + NUL. Must be kept in a Vec so the
     // pointer stays valid for the test's duration.
-    vec![-1i8, -2i8, 0i8]
+    // 0xFF, 0xFE, NUL as the platform's `c_char`, which is signed on x86_64
+    // and Apple Silicon but unsigned on aarch64-linux — writing them as
+    // negative `i8` literals only compiles on the signed half.
+    vec![0xFF_u8 as std::ffi::c_char, 0xFE_u8 as std::ffi::c_char, 0]
 }
 
 #[test]
