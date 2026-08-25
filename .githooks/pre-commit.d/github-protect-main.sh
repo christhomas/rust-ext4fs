@@ -131,15 +131,29 @@ case "$review_count" in '' | *[!0-9]*) review_count=0 ;; esac
 # to REMOVE a required check that discovery would otherwise keep re-adding, so
 # unlike discovery this path is allowed to strip.
 declared='[]'
-if [ -f "$dir/required-checks" ] && command -v jq >/dev/null 2>&1; then
-  declared=$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' "$dir/required-checks" \
-    | jq -sRc 'split("\n") | map(select(length > 0)) | map({context: .}) | unique')
-  case "$declared" in '' | null) declared='[]' ;; esac
-  if [ "$declared" = '[]' ]; then
-    # Comments-only or empty: NOT read as "require nothing" — a file someone
-    # blanked mid-edit must not silently unprotect the branch. Fall through to
-    # discovery; `none` is the explicit way to ask for an empty set.
-    echo "github-guard: $dir/required-checks lists no checks — ignoring it (write 'none' to require none)" >&2
+if command -v jq >/dev/null 2>&1; then
+  # This declaration is a PRIVILEGED input — it can REMOVE required checks (and
+  # `none` strips them all) — so read it from the TRUSTED default branch on the
+  # SERVER, never the working tree. This hook is pre-commit and runs against
+  # whatever is checked out; an untrusted branch (e.g. a contributor PR reviewed
+  # locally) carrying a `.githooks/required-checks` that says `none` must NOT be
+  # able to clear protection just because the owner commits while it is checked
+  # out. Reading the committed `$branch` copy means a policy change only takes
+  # effect once it is merged to the default branch. Absent/unreadable (404, no
+  # network, no jq) → '[]', i.e. fall through to discovery — never unprotect.
+  decl_raw=$(gh api "repos/$slug/contents/.githooks/required-checks?ref=$branch" \
+    -H "Accept: application/vnd.github.raw" 2>/dev/null) || decl_raw=""
+  if [ -n "$decl_raw" ]; then
+    declared=$(printf '%s\n' "$decl_raw" \
+      | sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' \
+      | jq -sRc 'split("\n") | map(select(length > 0)) | map({context: .}) | unique')
+    case "$declared" in '' | null) declared='[]' ;; esac
+    if [ "$declared" = '[]' ]; then
+      # Comments-only or empty: NOT read as "require nothing" — a file someone
+      # blanked mid-edit must not silently unprotect the branch. Fall through to
+      # discovery; `none` is the explicit way to ask for an empty set.
+      echo "github-guard: .githooks/required-checks on $branch lists no checks — ignoring it (write 'none' to require none)" >&2
+    fi
   fi
 fi
 
@@ -159,8 +173,6 @@ elif [ "$declared" != '[]' ]; then
       or (.context as $c | ($cur | index($c)) != null)
     )) | unique')
   skipped=$(printf '%s\n%s' "$declared" "$want" | jq -sc '(.[0] - .[1]) | map(.context)')
-  [ "$skipped" = '[]' ] || \
-    echo "github-guard: declared checks not required yet (never green on $branch): $skipped" >&2
   if [ "$want" = '[]' ]; then
     # Nothing declared is eligible — a typo, or an aggregate job that has not yet
     # run green on main. Keep whatever is required today rather than stripping the
@@ -168,7 +180,19 @@ elif [ "$declared" != '[]' ]; then
     # to the declared set on the first commit after that check passes on main.
     echo "github-guard: no declared check is eligible yet — keeping current required checks" >&2
     want="$current"
+  elif [ "$skipped" != '[]' ]; then
+    # PARTIAL declaration: some declared checks aren't eligible yet (never green on
+    # $branch). Do NOT exact-replace here — that would DROP currently-required
+    # checks the full declaration will re-add once the deferred ones green, leaving
+    # a WEAKER gate meanwhile (and omitting the ineligible replacements entirely).
+    # Union the eligible-declared set with what's already required; the exact
+    # declared set (which intentionally removes undeclared checks) applies only
+    # once EVERY declared check is eligible, i.e. the `skipped` list is empty.
+    echo "github-guard: declared checks not required yet (never green on $branch): $skipped — unioning with current until they green" >&2
+    want=$(printf '%s\n%s' "$want" "$current" | jq -sc 'add | unique')
   fi
+  # else (skipped empty): every declared check is eligible, so `want` is the exact
+  # declared set and undeclared checks are intentionally removed ("declared wins").
 # Checks to require: be strictly ADDITIVE — union what's already required with the
 # newly-discovered checks THAT HAVE PASSED ON MAIN, never a bare replace. A
 # discovery that's non-empty but PARTIAL (a PR-gating workflow whose latest run
