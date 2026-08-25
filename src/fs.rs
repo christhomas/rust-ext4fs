@@ -8,8 +8,9 @@ use crate::features;
 use crate::inode::Inode;
 use crate::mkfs::group_has_super;
 use crate::superblock::Superblock;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 /// In-memory accumulator for journaled multi-block writes. Each helper
 /// mutation reads the latest version of a block (from this buffer if
@@ -190,6 +191,20 @@ pub struct Filesystem {
     pub dev: Arc<dyn BlockDevice>,
     pub sb: Superblock,
     pub groups: Vec<BlockGroupDescriptor>,
+    /// Uninit flags this mount has already taken down on disk, by group.
+    ///
+    /// `groups` is a snapshot read once at mount and every write path holds
+    /// `&self`, so the snapshot cannot be corrected in place when a group's
+    /// INODE_UNINIT / BLOCK_UNINIT is cleared. That matters because the
+    /// allocators *plan* against those flags: a group still flagged uninit is
+    /// treated as entirely free without the bitmap being read at all. Left
+    /// stale, the second allocation into a freshly-woken group hands back the
+    /// very inode or block the first one just took — in the same mount, not
+    /// merely the next one.
+    ///
+    /// Read through [`Filesystem::allocation_groups`], which is what the
+    /// planners must be given.
+    uninit_cleared: Mutex<HashMap<usize, u16>>,
     pub csum: Checksummer,
     /// Dialect detected at mount time from the superblock's feature flags.
     /// Drives runtime dispatch where ext2 / ext3 / ext4 differ — most
@@ -283,6 +298,7 @@ impl Filesystem {
             dev,
             sb,
             groups,
+            uninit_cleared: Mutex::new(HashMap::new()),
             csum,
             flavor,
             journal: None,
@@ -767,7 +783,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             need_blocks,
             inode_group,
             &mut bitmap_reader,
@@ -1120,7 +1136,74 @@ impl Filesystem {
         }
         let new_flags = flags & !flag;
         block[flags_off..flags_off + 2].copy_from_slice(&new_flags.to_le_bytes());
+        // Record it against the mount-time snapshot too, or the very next
+        // allocation plans as though the group were still untouched. Recorded
+        // here rather than at commit: the buffer this wrote into is committed
+        // by the same operation, and a failure to commit fails the operation.
+        self.uninit_cleared
+            .lock()
+            .unwrap()
+            .entry(gi)
+            .and_modify(|f| *f &= !flag)
+            .or_insert(new_flags);
         Ok(true)
+    }
+
+    /// The group descriptors the allocators must plan against: the mount-time
+    /// snapshot, with any uninit flag this mount has since cleared taken back
+    /// out. Borrows the snapshot untouched in the overwhelmingly common case
+    /// where nothing has been cleared yet.
+    fn allocation_groups(&self) -> Cow<'_, [BlockGroupDescriptor]> {
+        let cleared = self.uninit_cleared.lock().unwrap();
+        if cleared.is_empty() {
+            return Cow::Borrowed(&self.groups);
+        }
+        let mut groups = self.groups.clone();
+        for (&gi, &flags) in cleared.iter() {
+            groups[gi].flags = flags;
+        }
+        Cow::Owned(groups)
+    }
+
+    /// The blocks group `gi` owns that physically live inside it, as
+    /// `(first_bit, count)` runs relative to the group's first block.
+    ///
+    /// Used when a BLOCK_UNINIT group's bitmap is zeroed for the first time:
+    /// everything here has to go straight back in, or the group's own
+    /// metadata becomes allocatable free space. Reading it off the descriptor
+    /// rather than deriving it from the feature flags means an unusual layout
+    /// is handled by inspection instead of by assumption.
+    fn group_owned_metadata_blocks(
+        &self,
+        gi: usize,
+        group_start: u64,
+        bpg: u64,
+    ) -> Vec<(u64, u64)> {
+        let bs = self.sb.block_size() as u64;
+        let mut runs = Vec::new();
+
+        // Superblock + group-descriptor-table backup, at the head of the
+        // group, for the groups the sparse_super rule gives one to.
+        if group_has_super(gi as u64) {
+            let gdt_blocks = (self.groups.len() as u64 * self.sb.desc_size as u64).div_ceil(bs);
+            runs.push((0, 1 + gdt_blocks));
+        }
+
+        // The group's own bitmaps and inode table, wherever the descriptor
+        // says they are — included only when that is inside this group.
+        let itable_blocks =
+            (self.sb.inodes_per_group as u64 * self.sb.inode_size as u64).div_ceil(bs);
+        let g = &self.groups[gi];
+        for (block, count) in [
+            (g.block_bitmap, 1),
+            (g.inode_bitmap, 1),
+            (g.inode_table, itable_blocks),
+        ] {
+            if block >= group_start && block < group_start + bpg {
+                runs.push((block - group_start, count));
+            }
+        }
+        runs
     }
 
     pub(crate) fn buffer_mark_block_run_used(
@@ -1150,27 +1233,33 @@ impl Filesystem {
         // its content block silently reused the directory's block number.
         //
         // Unlike an uninit inode bitmap, "all blocks free" isn't quite
-        // right here: a BLOCK_UNINIT group still owns whatever fixed
-        // overhead the classic RO_COMPAT_SPARSE_SUPER rule gives it (a
-        // superblock + GDT backup in groups 0, 1, and powers of 3/5/7) —
-        // those physically live in the group even though flex_bg moved the
-        // bitmap/inode-table blocks themselves to their flex cohort's head
-        // group. A group is only left BLOCK_UNINIT in the first place when
-        // mkfs never had to populate real bitmap/table data for it, which
-        // under flex_bg means it's never that head group — so the
-        // sparse_super backup is the *only* per-group reservation that can
-        // apply here, and it's the only one this accounts for.
+        // right here: a group still owns whatever fixed overhead physically
+        // lives inside it, and zeroing the bitmap without putting that back
+        // hands the group's own metadata out as free space. Two kinds of
+        // overhead can be there — the RO_COMPAT_SPARSE_SUPER superblock +
+        // GDT backup (groups 0, 1, and powers of 3/5/7), and the group's own
+        // block bitmap, inode bitmap and inode table.
+        //
+        // With flex_bg those last three usually sit in the cohort's head
+        // group, and a group is only left BLOCK_UNINIT when mkfs had no real
+        // bitmap/table data to write for it — so on a flex_bg volume they are
+        // reliably elsewhere. That is an assumption about the formatter,
+        // though, not something the on-disk format guarantees: without
+        // flex_bg every group holds its own. So rather than assume, ask where
+        // the descriptor actually points and reserve whatever lands inside
+        // this group.
         let was_uninit = self.clear_bgd_uninit_flag_if_set(buf, gi, BgdUninitFlag::Block)?;
+        let reserved_runs = if was_uninit {
+            self.group_owned_metadata_blocks(gi, group_start, bpg)
+        } else {
+            Vec::new()
+        };
         let bitmap_block = self.groups[gi].block_bitmap;
         let bm = buf.get_mut(self, bitmap_block)?;
         if was_uninit {
             bm.iter_mut().for_each(|byte| *byte = 0);
-            if group_has_super(gi as u64) {
-                let desc_size = self.sb.desc_size as u64;
-                let bs = self.sb.block_size() as u64;
-                let gdt_blocks = (self.groups.len() as u64 * desc_size).div_ceil(bs);
-                let reserved = 1 + gdt_blocks; // superblock backup + GDT backup
-                for bit in 0..reserved.min(bpg) {
+            for (first_bit, count) in reserved_runs {
+                for bit in first_bit..(first_bit + count).min(bpg) {
                     let byte = (bit / 8) as usize;
                     let mask = 1u8 << (bit % 8);
                     if byte < bm.len() {
@@ -1934,7 +2023,7 @@ impl Filesystem {
         let inode_group = (ino - 1) / self.sb.inodes_per_group;
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             1,
             inode_group,
             &mut bitmap_reader,
@@ -2234,7 +2323,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_inode_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             false,
             parent_group,
             &mut bitmap_reader,
@@ -2484,7 +2573,7 @@ impl Filesystem {
             let mut bitmap_reader = |block: u64| self.read_block(block);
             let bplan = crate::alloc::plan_block_allocation(
                 &self.sb,
-                &self.groups,
+                &self.allocation_groups(),
                 1,
                 parent_group,
                 &mut bitmap_reader,
@@ -2735,7 +2824,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             needed_blocks,
             group_idx_of_inode as u32,
             &mut bitmap_reader,
@@ -2856,7 +2945,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             total_run,
             group_idx_of_inode as u32,
             &mut bitmap_reader,
@@ -3087,7 +3176,7 @@ impl Filesystem {
                         };
                         crate::alloc::plan_block_allocation(
                             &self.sb,
-                            &self.groups,
+                            &self.allocation_groups(),
                             want,
                             group_idx_of_inode,
                             &mut bitmap_reader,
@@ -3172,7 +3261,7 @@ impl Filesystem {
                                     };
                                     crate::alloc::plan_block_allocation(
                                         &self.sb,
-                                        &self.groups,
+                                        &self.allocation_groups(),
                                         1,
                                         group_idx_of_inode,
                                         &mut bitmap_reader,
@@ -3774,7 +3863,7 @@ impl Filesystem {
         // 1. Allocate inode (is_dir = true so Orlov picks a dir-friendly group).
         let iplan = crate::alloc::plan_inode_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             true,
             parent_group,
             &mut bitmap_reader,
@@ -3784,7 +3873,7 @@ impl Filesystem {
         // 2. Allocate one data block for the dir contents.
         let bplan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             1,
             iplan.bgd.group_idx,
             &mut bitmap_reader,
@@ -4414,7 +4503,7 @@ impl Filesystem {
         let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
-            &self.groups,
+            &self.allocation_groups(),
             1,
             parent_group,
             &mut bitmap_reader,
@@ -4492,7 +4581,7 @@ impl Filesystem {
                     };
                     let meta_plan = crate::alloc::plan_block_allocation(
                         &self.sb,
-                        &self.groups,
+                        &self.allocation_groups(),
                         1,
                         parent_group,
                         &mut reader2,
@@ -4628,7 +4717,7 @@ impl Filesystem {
             };
             let meta_plan = crate::alloc::plan_block_allocation(
                 &self.sb,
-                &self.groups,
+                &self.allocation_groups(),
                 1,
                 parent_group,
                 &mut bm_reader,
