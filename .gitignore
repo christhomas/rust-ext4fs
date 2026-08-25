@@ -24,3 +24,6 @@ test-disks/test-run/
 .qemu/
 **/.vagrant/
 .claude/
+
+# VM harness scratch (images exchanged with the oracle VM).
+.vm-share/

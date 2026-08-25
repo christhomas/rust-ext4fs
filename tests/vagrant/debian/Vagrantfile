@@ -1,0 +1,121 @@
+# Debian arm64 VM — the real-Linux oracle for this driver.
+#
+# Why a VM: e2fsck, mkfs.ext4 and the in-kernel ext4 driver are
+# Linux-only. macOS can run none of them, and validating this driver
+# against anything less than a real kernel is marking our own homework.
+#
+# This replaces an emulated x86_64 Alpine guest. On Apple Silicon that
+# meant full CPU emulation for every e2fsck run; an arm64 guest under
+# HVF runs at hardware speed.
+#
+# Provider is QEMU with HVF on Apple Silicon — an arm64 guest runs with
+# hardware acceleration, so there is no emulation penalty and no
+# third-party hypervisor to install.
+#
+# Prerequisites (macOS/arm64):
+#   brew install antimatter-studios/tap/qemu
+#   brew install antimatter-studios/tap/virtiofsd
+#   vagrant plugin install vagrant-qemu-christhomas
+#   vagrant plugin install vagrant-notify-forwarder-christhomas
+#
+# CI does not use this file. GitHub's Linux runners are already Linux and
+# run mkfs + loop-mount natively; this VM gives developers the same gate.
+
+unless Vagrant.has_plugin?("vagrant-qemu-christhomas")
+  raise "Install required plugin: vagrant plugin install vagrant-qemu-christhomas"
+end
+
+# DO NOT set `config.notify_forwarder.enable = false`. The plugin's `up`
+# action hook truncates the qemu boot chain when the forwarder is
+# disabled: the VM imports successfully and then never boots, with no
+# error printed. Either leave it enabled or do not load the plugin at
+# all. This cost an afternoon once already.
+unless Vagrant.has_plugin?("vagrant-notify-forwarder-christhomas")
+  raise "Install required plugin: vagrant plugin install vagrant-notify-forwarder-christhomas"
+end
+
+host_arch = RbConfig::CONFIG["host_cpu"]
+is_arm = host_arch.match?(/aarch64|arm64/)
+has_kvm = File.exist?("/dev/kvm") && File.writable?("/dev/kvm")
+
+Vagrant.configure("2") do |config|
+  # A box with a working UEFI bootloader and a kernel carrying the xfs and
+  # btrfs modules (both verified to modprobe cleanly). generic/debian12 is
+  # deliberately NOT used: it was rebuilt upstream without its \EFI\BOOT
+  # bootloader and no longer boots on a fresh clone.
+  config.vm.box = "christhomas/vagrant-rpi-bookworm-arm64"
+  if Gem::Version.new(Vagrant::VERSION) >= Gem::Version.new("2.4.0")
+    config.vm.box_architecture = is_arm ? "arm64" : "amd64"
+  end
+  config.vm.box_check_update = false
+  config.vm.hostname = "ext4-oracle"
+
+  # The qemu plugin daemonizes qemu and routes the serial console to a
+  # socket, so a failed boot prints nothing at all to the terminal. Give
+  # it room rather than failing at the default 300s.
+  config.vm.boot_timeout = 600
+
+  config.vm.provider "qemu" do |qe|
+    if is_arm
+      qe.arch = "aarch64"
+      accel = Vagrant::Util::Platform.darwin? ? "hvf" : (has_kvm ? "kvm" : "tcg")
+      qe.machine = "virt,accel=#{accel},highmem=on"
+      qe.cpu = (accel == "tcg") ? "max" : "host"
+      qe.net_device = "virtio-net-device"
+    else
+      qe.arch = "x86_64"
+      qe.machine = has_kvm ? "q35,accel=kvm" : "q35,accel=tcg"
+      qe.cpu = has_kvm ? "host" : "max"
+      qe.net_device = "virtio-net-pci"
+    end
+
+    qe.smp = ENV.fetch("EXT4_VM_SMP", "cpus=4,sockets=1,cores=4,threads=1")
+    qe.memory = ENV.fetch("EXT4_VM_MEMORY", "4G")
+    qe.ssh_port = 50124
+    qe.ssh_auto_correct = true
+
+    # Room for multi-GiB test images alongside the toolchain.
+    qe.disk_resize = ENV.fetch("EXT4_VM_DISK", "32G")
+
+    custom_virtiofsd = "/opt/homebrew/bin/virtiofsd-1.13.8-rc1"
+    qe.virtiofsd_bin = custom_virtiofsd if File.executable?(custom_virtiofsd)
+
+    # virtiofsd presents host files to the guest under this uid/gid. It
+    # must match the guest's own vagrant user or the share is read-only to
+    # it -- this box numbers vagrant 1001, not the plugin's 1000 default.
+    qe.virtiofs_guest_uid = 1001
+    qe.virtiofs_guest_gid = 1001
+
+    # --xattr is required: extended attributes are part of the XFS feature
+    # matrix, and fixtures that set them must survive the share.
+    qe.extra_virtiofsd_args = ["--thread-pool-size=1", "--xattr"]
+  end
+
+  # Disable Vagrant's default share so it cannot fall back to SMB, which
+  # prompts for credentials and breaks a non-interactive `up`.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  # Images and manifests are exchanged here: the host drops an image in,
+  # the guest mounts and inspects it, or the guest builds one for the host
+  # to parse. Gitignored.
+  config.vm.synced_folder File.expand_path("../../../.vm-share", __dir__),
+                          "/share",
+                          type: "virtiofs",
+                          create: true
+
+  config.notify_forwarder.enable = true
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    # e2fsprogs   -- mkfs.ext4, e2fsck, dumpe2fs: the oracle tooling
+    # xfsprogs & btrfs-progs -- the same box serves the sibling drivers
+    # attr/acl    -- setfattr/setfacl for feature-rich fixtures
+    apt-get install -y -qq e2fsprogs xfsprogs btrfs-progs attr acl
+    modprobe xfs
+    modprobe btrfs
+    mkfs.ext4 -V
+    e2fsck -V
+  SHELL
+end
