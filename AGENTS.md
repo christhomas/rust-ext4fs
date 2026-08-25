@@ -56,6 +56,37 @@ A bad-but-marked-clean checksum passes it. For checksum bugs, either recompute
 the specific checksum in-process (jsb example above) or cross-check with a real
 ext4 (below).
 
+## The oracle VM
+
+`e2fsck`, `mkfs.ext4` and the in-kernel ext4 driver are Linux-only, so
+on macOS they live in a Debian arm64 VM under QEMU with HVF — hardware
+accelerated, unlike the x86_64 Alpine guest it replaced, which meant
+full CPU emulation for every check on Apple Silicon.
+
+```sh
+./scripts/vm.sh up                       # boot; idempotent
+./scripts/vm-e2fsck.sh <image>...        # e2fsck -fn each image
+./scripts/vm.sh run <cmd>                # arbitrary command in the guest
+./scripts/vm.sh down                     # halt; next `up` is fast
+```
+
+The VM stays up between invocations on purpose: booting is the slow
+part, so an iterate-and-check loop should pay it once. A check costs
+about 6 seconds once the VM is warm.
+
+Two traps, both already paid for by the sibling drivers:
+
+1. **Never set `config.notify_forwarder.enable = false`.** The plugin's
+   `up` hook truncates the QEMU boot chain — the VM imports and then
+   never boots, printing no error at all.
+2. **`qe.virtiofs_guest_uid`/`gid` must match the box's `vagrant` user**
+   (1001 here, not the plugin's 1000 default), or the shared folder is
+   read-only to the guest and every fixture write fails with a bare
+   permission error.
+
+Ports are per-crate so several oracle VMs can run at once: xfs 50122,
+btrfs 50123, ext4 50124.
+
 ## Cross-validation: the real-ext4 oracle (use this for checksum/layout bugs)
 
 The driver shares this crate's spec interpretation, so its own
