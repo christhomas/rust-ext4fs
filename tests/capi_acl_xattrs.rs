@@ -28,7 +28,14 @@ fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
 fn names_on(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
     let p = CString::new(path).unwrap();
     let mut buf = vec![0u8; 1024];
-    let n = unsafe { fs_ext4_listxattr(fs, p.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let n = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     if n < 0 {
         let err = unsafe {
             std::ffi::CStr::from_ptr(fs_ext4_last_error())

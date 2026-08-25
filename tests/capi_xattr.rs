@@ -55,8 +55,14 @@ fn listxattr_writes_names_nul_separated() {
     let path = CString::new("/tagged.txt").unwrap();
 
     let mut buf = vec![0u8; 256];
-    let ret =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert!(ret > 0, "listxattr failed: {}", last_err_str());
 
     let names = parse_nul_names(&buf[..ret as usize]);
@@ -78,8 +84,14 @@ fn listxattr_plain_file_has_no_user_xattrs() {
     let path = CString::new("/plain.txt").unwrap();
 
     let mut buf = vec![0u8; 256];
-    let ret =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert!(ret >= 0, "listxattr failed: {}", last_err_str());
 
     let names = parse_nul_names(&buf[..ret as usize]);
@@ -170,8 +182,14 @@ fn listxattr_directory_has_xattrs() {
     let path = CString::new("/tagged_dir").unwrap();
 
     let mut buf = vec![0u8; 256];
-    let ret =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert!(ret > 0, "listxattr on dir failed: {}", last_err_str());
 
     let names = parse_nul_names(&buf[..ret as usize]);
@@ -222,8 +240,14 @@ fn listxattr_undersized_buf_still_reports_required() {
     let path = CString::new("/tagged.txt").unwrap();
 
     let mut tiny = [0u8; 4];
-    let required =
-        unsafe { fs_ext4_listxattr(fs, path.as_ptr(), tiny.as_mut_ptr() as *mut i8, tiny.len()) };
+    let required = unsafe {
+        fs_ext4_listxattr(
+            fs,
+            path.as_ptr(),
+            tiny.as_mut_ptr() as *mut std::ffi::c_char,
+            tiny.len(),
+        )
+    };
     // Even with a tiny buffer, return value is the full required size so
     // callers can re-allocate and retry.
     assert!(required >= 37, "expected >=37, got {required}");

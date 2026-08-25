@@ -118,7 +118,14 @@ fn inline_data_symlink_readlink() {
     let path = CString::new("/symlink").unwrap();
 
     let mut buf = [0u8; 128];
-    let rc = unsafe { fs_ext4_readlink(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let rc = unsafe {
+        fs_ext4_readlink(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert_eq!(rc, 0, "readlink failed: {}", last_err_str());
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     assert_eq!(&buf[..end], b"target/path/here");

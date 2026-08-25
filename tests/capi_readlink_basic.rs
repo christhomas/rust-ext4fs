@@ -46,7 +46,14 @@ fn readlink_on_basic_link_returns_expected_target() {
     }
 
     let mut buf = [0u8; 256];
-    let rc = unsafe { fs_ext4_readlink(fs, p.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let rc = unsafe {
+        fs_ext4_readlink(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert_eq!(rc, 0, "readlink failed");
 
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -63,7 +70,14 @@ fn readlink_on_regular_file_sets_einval() {
     };
     let p = CString::new("/test.txt").unwrap();
     let mut buf = [0u8; 64];
-    let rc = unsafe { fs_ext4_readlink(fs, p.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let rc = unsafe {
+        fs_ext4_readlink(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert_eq!(rc, -1);
     assert_eq!(fs_ext4_last_errno(), 22); // EINVAL
     let err = unsafe {
@@ -82,7 +96,14 @@ fn readlink_on_directory_sets_einval() {
     };
     let p = CString::new("/subdir").unwrap();
     let mut buf = [0u8; 64];
-    let rc = unsafe { fs_ext4_readlink(fs, p.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let rc = unsafe {
+        fs_ext4_readlink(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert_eq!(rc, -1);
     assert_eq!(fs_ext4_last_errno(), 22); // EINVAL
     unsafe { fs_ext4_umount(fs) };
@@ -95,7 +116,14 @@ fn readlink_on_missing_path_sets_enoent() {
     };
     let p = CString::new("/does-not-exist").unwrap();
     let mut buf = [0u8; 64];
-    let rc = unsafe { fs_ext4_readlink(fs, p.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let rc = unsafe {
+        fs_ext4_readlink(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
+            buf.len(),
+        )
+    };
     assert_eq!(rc, -1);
     assert_eq!(fs_ext4_last_errno(), 2); // ENOENT
     unsafe { fs_ext4_umount(fs) };
