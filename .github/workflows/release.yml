@@ -129,10 +129,32 @@ jobs:
         with:
           toolchain: 1.95.0
 
+      # A version already on crates.io cannot be published again, and a
+      # re-tag — or a release published by hand — would otherwise fail
+      # this job every time. Skip instead, so the workflow is idempotent
+      # and a red run means something actually went wrong.
+      - name: skip if this version is already on crates.io
+        id: already
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="$(grep -m1 '^name = ' Cargo.toml | sed 's/name = //; s/"//g')"
+          version="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = //; s/"//g')"
+          if curl -sf "https://crates.io/api/v1/crates/$name/$version" \
+               -H 'User-Agent: release-workflow' >/dev/null 2>&1; then
+            echo "$name $version is already published; nothing to do."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$name $version is not on crates.io; publishing."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: rust-lang/crates-io-auth-action@v1.0.4
+        if: steps.already.outputs.published == 'false'
         id: auth
 
       - name: cargo publish
+        if: steps.already.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         # No `--locked`: publish must rewrite the `am-fs-core` path
