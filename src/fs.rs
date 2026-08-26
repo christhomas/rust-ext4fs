@@ -6,7 +6,6 @@ use crate::checksum::Checksummer;
 use crate::error::{Error, Result};
 use crate::features;
 use crate::inode::Inode;
-use crate::mkfs::group_has_super;
 use crate::superblock::Superblock;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +22,15 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct BlockBuffer {
     pub block_size: u32,
     pub dirty: BTreeMap<u64, Vec<u8>>,
+    /// Uninit flags this buffer clears, and the descriptor flags they
+    /// leave behind, held until the buffer is committed.
+    ///
+    /// They cannot be published earlier. Clearing a group's uninit flag
+    /// is what tells later allocations its bitmap is real and may be
+    /// read; if the commit then fails, the bitmap on disk is still the
+    /// unspecified bytes the flag existed to license skipping, and a
+    /// planner that trusted the flag would allocate out of them.
+    pub uninit_cleared: BTreeMap<usize, u16>,
 }
 
 impl BlockBuffer {
@@ -30,6 +38,7 @@ impl BlockBuffer {
         Self {
             block_size,
             dirty: BTreeMap::new(),
+            uninit_cleared: BTreeMap::new(),
         }
     }
 
@@ -1137,12 +1146,16 @@ impl Filesystem {
         let new_flags = flags & !flag;
         block[flags_off..flags_off + 2].copy_from_slice(&new_flags.to_le_bytes());
         // Record it against the mount-time snapshot too, or the very next
-        // allocation plans as though the group were still untouched. Recorded
-        // here rather than at commit: the buffer this wrote into is committed
-        // by the same operation, and a failure to commit fails the operation.
-        self.uninit_cleared
-            .lock()
-            .unwrap()
+        // allocation plans as though the group were still untouched — but
+        // record it on the *buffer*, so it becomes visible only when the
+        // buffer commits.
+        //
+        // Publishing it here instead would survive a failed commit: the
+        // operation returns an error, the mount carries on, and the next
+        // allocation is told the group's bitmap is initialised while the
+        // bytes on disk are still whatever the uninit flag licensed
+        // leaving there.
+        buf.uninit_cleared
             .entry(gi)
             .and_modify(|f| *f &= !flag)
             .or_insert(new_flags);
@@ -1182,11 +1195,25 @@ impl Filesystem {
         let bs = self.sb.block_size() as u64;
         let mut runs = Vec::new();
 
-        // Superblock + group-descriptor-table backup, at the head of the
-        // group, for the groups the sparse_super rule gives one to.
-        if group_has_super(gi as u64) {
+        // Superblock, group-descriptor-table backup and the blocks held
+        // back for growing the table, at the head of every group that
+        // carries a backup.
+        //
+        // Which groups those are is the filesystem's decision, not a
+        // constant: `SPARSE_SUPER2` puts backups in two named groups and
+        // no others, and a filesystem without `SPARSE_SUPER` puts one in
+        // every group. Assuming the classic rule reports "no backup
+        // here" for groups that have one, and a rebuilt bitmap then
+        // offers a live backup superblock as free space.
+        //
+        // `s_reserved_gdt_blocks` belongs in the same run. It sits
+        // between the descriptor table and the block bitmap, and it is
+        // the room the filesystem keeps to grow into — free-looking, and
+        // not free.
+        if self.sb.group_has_super(gi as u64) {
             let gdt_blocks = (self.groups.len() as u64 * self.sb.desc_size as u64).div_ceil(bs);
-            runs.push((0, 1 + gdt_blocks));
+            let reserved = u64::from(self.sb.reserved_gdt_blocks);
+            runs.push((0, 1 + gdt_blocks + reserved));
         }
 
         // The group's own bitmaps and inode table, wherever the descriptor
@@ -1732,6 +1759,13 @@ impl Filesystem {
         if buf.dirty.is_empty() {
             return Ok(());
         }
+        let cleared = buf.uninit_cleared.clone();
+        let publish = |fs: &Self| {
+            let mut map = fs.uninit_cleared.lock().unwrap();
+            for (gi, flags) in cleared {
+                map.entry(gi).and_modify(|f| *f &= flags).or_insert(flags);
+            }
+        };
         if let Some(jw_mu) = &self.journal {
             let mut jw = jw_mu.lock().map_err(|_| {
                 Error::Corrupt("journal writer mutex poisoned (prior write panicked)")
@@ -1747,13 +1781,16 @@ impl Filesystem {
             for (block, bytes) in buf.dirty {
                 self.dev.populate_cache(block, bytes);
             }
+            publish(self);
             Ok(())
         } else {
             let bs = self.sb.block_size() as u64;
             for (block, bytes) in buf.dirty {
                 self.dev.write_at(block * bs, &bytes)?;
             }
-            self.dev.flush()
+            self.dev.flush()?;
+            publish(self);
+            Ok(())
         }
     }
 

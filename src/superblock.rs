@@ -62,6 +62,18 @@ pub struct Superblock {
     /// in another machine?").
     pub last_mounted: String,
     pub desc_size: u16, // BGD size: 32 or 64
+    /// `s_reserved_gdt_blocks` — blocks held back after the group
+    /// descriptor table so the filesystem can be grown online.
+    ///
+    /// They sit between the GDT and the block bitmap in every group that
+    /// carries a superblock backup, and they are **not** free space:
+    /// anything that rebuilds a block bitmap has to mark them used or
+    /// the next allocation writes over the filesystem's own room to
+    /// expand.
+    pub reserved_gdt_blocks: u16,
+    /// `s_backup_bgs` — the only two groups carrying backups when
+    /// `SPARSE_SUPER2` is set. Meaningless without that feature.
+    pub backup_bgs: [u32; 2],
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
     pub checksum_seed: u32, // s_checksum_seed (used when INCOMPAT_CSUM_SEED)
@@ -95,6 +107,22 @@ pub struct Superblock {
     /// `s_def_resgid` (0x52). GID with access to reserved blocks.
     pub def_resgid: u16,
     pub raw: Vec<u8>, // keep raw bytes for re-checksum on writes (future)
+}
+
+/// The classic `RO_COMPAT_SPARSE_SUPER` layout: groups 0 and 1, and
+/// every power of 3, 5 or 7.
+///
+/// Separate from [`Superblock::group_has_super`] because `mkfs` needs the
+/// rule without a filesystem to ask — it is deciding what to write, not
+/// reading what someone else wrote.
+pub(crate) fn classic_sparse_super(g: u64) -> bool {
+    fn is_power_of(mut g: u64, base: u64) -> bool {
+        while g.is_multiple_of(base) {
+            g /= base;
+        }
+        g == 1
+    }
+    g <= 1 || is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
 }
 
 impl Superblock {
@@ -169,6 +197,22 @@ impl Superblock {
             u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap())
         } else {
             0
+        };
+
+        // s_reserved_gdt_blocks at 0xCE, and s_backup_bgs at 0x274. Both
+        // are zero on a revision-0 filesystem, which has neither.
+        let reserved_gdt_blocks = if rev_level >= 1 {
+            u16::from_le_bytes(raw[0xCE..0xD0].try_into().unwrap())
+        } else {
+            0
+        };
+        let backup_bgs = if rev_level >= 1 && raw.len() >= 0x27C {
+            [
+                u32::from_le_bytes(raw[0x274..0x278].try_into().unwrap()),
+                u32::from_le_bytes(raw[0x278..0x27C].try_into().unwrap()),
+            ]
+        } else {
+            [0, 0]
         };
 
         let mut uuid = [0u8; 16];
@@ -263,6 +307,8 @@ impl Superblock {
             volume_name,
             last_mounted,
             desc_size,
+            reserved_gdt_blocks,
+            backup_bgs,
             hash_seed,
             default_hash_version,
             checksum_seed,
@@ -291,6 +337,39 @@ impl Superblock {
         self.state & EXT4_VALID_FS != 0
     }
 
+    /// Whether block group `g` carries a superblock and group-descriptor
+    /// backup.
+    ///
+    /// Three layouts, and the filesystem's own flags decide which:
+    ///
+    /// - **`SPARSE_SUPER2`**: group 0, and the two groups named by
+    ///   `s_backup_bgs`. Nothing else.
+    /// - **`SPARSE_SUPER` clear**: every group. This is the old ext2
+    ///   layout, and the one that costs most to get wrong — assuming the
+    ///   sparse rule leaves real backups looking like free space.
+    /// - **otherwise**: the classic sparse rule — groups 0 and 1, and
+    ///   every power of 3, 5 or 7.
+    ///
+    /// Answering unconditionally with the classic rule is wrong in both
+    /// of the first two cases, and wrong in the direction that matters:
+    /// on a filesystem without `SPARSE_SUPER` it reports "no backup here"
+    /// for groups that have one, so a rebuilt bitmap offers the backup
+    /// superblock and its descriptor table as free blocks.
+    pub fn group_has_super(&self, g: u64) -> bool {
+        use crate::features::{Compat, RoCompat};
+
+        if g == 0 {
+            return true;
+        }
+        if self.feature_compat & Compat::SPARSE_SUPER2.bits() != 0 {
+            return self.backup_bgs.iter().any(|&b| u64::from(b) == g);
+        }
+        if self.feature_ro_compat & RoCompat::SPARSE_SUPER.bits() == 0 {
+            return true;
+        }
+        classic_sparse_super(g)
+    }
+
     /// Block size in bytes: 1024 << log_block_size.
     pub fn block_size(&self) -> u32 {
         1024u32 << self.log_block_size
@@ -304,5 +383,96 @@ impl Superblock {
     /// Whether the 64BIT incompat feature is enabled.
     pub fn is_64bit(&self) -> bool {
         self.feature_incompat & crate::features::Incompat::BIT64.bits() != 0
+    }
+}
+
+#[cfg(test)]
+mod backup_layout_tests {
+    use super::*;
+    use crate::features::{Compat, RoCompat};
+
+    /// A superblock with only the fields the backup-layout rule reads.
+    fn sb_with(compat: u32, ro_compat: u32, backup_bgs: [u32; 2], reserved_gdt: u16) -> Superblock {
+        let mut raw = vec![0u8; SUPERBLOCK_SIZE];
+        raw[0x38..0x3A].copy_from_slice(&EXT4_MAGIC.to_le_bytes());
+        raw[0x00..0x04].copy_from_slice(&8192u32.to_le_bytes()); // inodes_count
+        raw[0x04..0x08].copy_from_slice(&65536u32.to_le_bytes()); // blocks_count
+        raw[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // first_data_block
+        raw[0x20..0x24].copy_from_slice(&8192u32.to_le_bytes()); // blocks_per_group
+        raw[0x28..0x2C].copy_from_slice(&2048u32.to_le_bytes()); // inodes_per_group
+        raw[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // rev_level
+        raw[0x58..0x5A].copy_from_slice(&256u16.to_le_bytes()); // inode_size
+        raw[0x5C..0x60].copy_from_slice(&compat.to_le_bytes());
+        raw[0x64..0x68].copy_from_slice(&ro_compat.to_le_bytes());
+        raw[0xCE..0xD0].copy_from_slice(&reserved_gdt.to_le_bytes());
+        raw[0xFE..0x100].copy_from_slice(&64u16.to_le_bytes()); // desc_size
+        raw[0x274..0x278].copy_from_slice(&backup_bgs[0].to_le_bytes());
+        raw[0x278..0x27C].copy_from_slice(&backup_bgs[1].to_le_bytes());
+        Superblock::parse(raw).expect("superblock")
+    }
+
+    /// The layout nearly every filesystem has: groups 0 and 1, then the
+    /// powers of 3, 5 and 7.
+    #[test]
+    fn the_classic_sparse_layout() {
+        let sb = sb_with(0, RoCompat::SPARSE_SUPER.bits(), [0, 0], 0);
+        for g in [0, 1, 3, 5, 7, 9, 25, 27, 49, 81, 125] {
+            assert!(sb.group_has_super(g), "group {g} should carry a backup");
+        }
+        for g in [2, 4, 6, 8, 10, 11, 26, 50, 100] {
+            assert!(!sb.group_has_super(g), "group {g} should not");
+        }
+    }
+
+    /// Without `SPARSE_SUPER`, every group carries one.
+    ///
+    /// This is the case that costs data rather than capacity: answering
+    /// with the sparse rule reports "no backup here" for groups that have
+    /// one, so rebuilding a bitmap offers a live backup superblock and its
+    /// descriptor table as free space.
+    #[test]
+    fn without_sparse_super_every_group_carries_a_backup() {
+        let sb = sb_with(0, 0, [0, 0], 0);
+        for g in 0..40 {
+            assert!(sb.group_has_super(g), "group {g} should carry a backup");
+        }
+    }
+
+    /// `SPARSE_SUPER2` names exactly two groups, and no rule applies
+    /// beyond them.
+    #[test]
+    fn sparse_super2_names_its_own_groups() {
+        let sb = sb_with(
+            Compat::SPARSE_SUPER2.bits(),
+            RoCompat::SPARSE_SUPER.bits(),
+            [4, 17],
+            0,
+        );
+        assert!(sb.group_has_super(0), "group 0 always carries one");
+        assert!(sb.group_has_super(4));
+        assert!(sb.group_has_super(17));
+        // Powers of 3, 5 and 7 are not special here, and group 1 is not
+        // either — which is what distinguishes this from the classic rule
+        // rather than merely narrowing it.
+        for g in [1, 3, 5, 7, 9, 25, 49] {
+            assert!(
+                !sb.group_has_super(g),
+                "group {g} is not named by s_backup_bgs and must not be treated as \
+                 carrying a backup"
+            );
+        }
+    }
+
+    /// The field that says how much room the filesystem keeps to grow.
+    #[test]
+    fn reserved_gdt_blocks_is_read() {
+        assert_eq!(
+            sb_with(0, RoCompat::SPARSE_SUPER.bits(), [0, 0], 1024).reserved_gdt_blocks,
+            1024
+        );
+        assert_eq!(
+            sb_with(0, RoCompat::SPARSE_SUPER.bits(), [0, 0], 0).reserved_gdt_blocks,
+            0
+        );
     }
 }

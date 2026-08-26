@@ -643,18 +643,14 @@ fn format_block_groups(
     Ok(())
 }
 
-/// True if block group `g` carries a superblock + GDT backup under the classic
-/// RO_COMPAT_SPARSE_SUPER rule: group 0, group 1, and every power of 3, 5, or
-/// 7. Mirrors the kernel's / e2fsprogs' `ext4_bg_has_super`.
-pub(crate) fn group_has_super(g: u64) -> bool {
-    fn is_power_of(mut g: u64, base: u64) -> bool {
-        while g.is_multiple_of(base) {
-            g /= base;
-        }
-        g == 1
-    }
-    g <= 1 || is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
-}
+/// True if block group `g` carries a superblock + GDT backup.
+///
+/// `mkfs` always writes the classic sparse layout, so it asks for that
+/// rule directly. Reading an existing filesystem must not — see
+/// [`crate::superblock::Superblock::group_has_super`], which consults the
+/// flags, because the filesystem in hand may have been made by something
+/// that chose differently.
+pub(crate) use crate::superblock::classic_sparse_super as group_has_super;
 
 /// Build a clean JBD2 v2 superblock for a fresh ext3 journal. Layout per
 /// `jbd2.rs` module docs (big-endian throughout, magic 0xc03b3998 + V2
