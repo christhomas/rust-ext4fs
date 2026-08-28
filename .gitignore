@@ -27,3 +27,10 @@ test-disks/test-run/
 
 # VM harness scratch (images exchanged with the oracle VM).
 .vm-share/
+
+# chore fingerprint cache (sources:/generates: checksums). Derived data.
+.chore/
+
+# Build output. `chore staticlib` writes the archive and headers here for a
+# consumer to copy out of (`chore artifact` prints this directory).
+/dist/
