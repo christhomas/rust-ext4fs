@@ -73,6 +73,19 @@ tasks:
       # consumer handed only fs_ext4.h cannot compile.
       - 'cp "../rust-fs-core/include/fs_core.h" "{{.OUT}}/include/fs_core.h"'
 
+  lint:
+    desc: Formatting and clippy, exactly as CI runs them
+    # `--locked` is not decoration. It makes the build fail rather than
+    # silently update Cargo.lock, which is what keeps a local gate and
+    # CI checking the same dependency versions — and it is what the
+    # release process relies on.
+    #
+    # This exists so the CI gate can be reproduced locally. If the two
+    # ever differ, this is the copy that is wrong.
+    cmds:
+      - cargo fmt --check
+      - cargo clippy --locked --all-targets -- -D warnings
+
   build:
     desc: Debug build
     cmds: ['cargo build']
