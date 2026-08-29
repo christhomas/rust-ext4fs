@@ -284,6 +284,18 @@ ticked. Numbering follows the plan doc.
 
 Highlights from the last 50 commits, grouped by date.
 
+### 2026-08-29 — 0.4.1 — the multi-group formatter in front of e2fsck
+
+- `mkfs` output is now checked against `e2fsck` at three and five block
+  groups, including a short final group, and both sizes run in CI. No bug
+  was found: the arithmetic was right, it had simply never been checked.
+- Three `mkfs.ext4` CLI bugs: `-c` consumed the device path and then
+  failed about the path it had just eaten; `-b` reported a bad block size
+  only after opening the device; `-q` suppressed warnings only when it
+  came first.
+- A rebuilt block bitmap reserves what it must not hand out, and a
+  group's uninitialised flags are cleared when it is first allocated from.
+
 ### 2026-06-30 — 0.4.0 — multiple block groups + write-path/mkfs correctness
 
 - Multiple block groups for ext4 (full GDT + per-group bitmaps/inode tables;
