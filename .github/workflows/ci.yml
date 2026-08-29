@@ -96,8 +96,7 @@ jobs:
           key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
       - name: Build mkfs_ext4
         run: cargo build --locked --release --bin mkfs_ext4
-      # 32 MiB is the v1 single-block-group cap. Keep it as the smoke
-      # test target and add a larger one once multi-group lands.
+      # 32 MiB at the default 4 KiB block size is one block group.
       - name: Format 32 MiB image and validate with fsck.ext4
         run: |
           truncate -s 32M /tmp/out.img
@@ -106,6 +105,39 @@ jobs:
           # any repair offer (so this is read-only and exits non-zero
           # if anything is wrong rather than silently auto-fixing).
           fsck.ext4 -fnv /tmp/out.img
+      # Every real-world volume this formatter writes is multi-group, and for
+      # a long time none of that code had faced fsck: the backup superblock +
+      # GDT loop, the s_block_group_nr patch and its checksum recompute, the
+      # short-final-group bitmap padding and the cross-group free-block
+      # accumulation were checked only by this crate's own reader, which
+      # trusts the counters it is shown and cannot see a wrong checksum.
+      #
+      # 320 MiB / 4 KiB = three groups with a half-length tail; 640 MiB = five
+      # whole groups, the smallest count that reaches past "groups 0 and 1"
+      # into the sparse-super powers-of-3/5/7 rule (backups in 0, 1 and 3).
+      # Both images are sparse, so the runner pays for the ~2 MiB of metadata
+      # per group and nothing else.
+      - name: Format multi-group images and validate with fsck.ext4
+        run: |
+          truncate -s 320M /tmp/mg3.img
+          truncate -s 640M /tmp/mg5.img
+          ./target/release/mkfs_ext4 -L CIMULTI3 /tmp/mg3.img
+          ./target/release/mkfs_ext4 -L CIMULTI5 /tmp/mg5.img
+          fsck.ext4 -fnv /tmp/mg3.img
+          fsck.ext4 -fnv /tmp/mg5.img
+          # Open each one through a BACKUP superblock too. The primary is
+          # what the checks above read; -b points fsck at a backup instead,
+          # so its s_block_group_nr and its recomputed checksum have to be
+          # right or the open fails outright. Block 32768 is group 1 and
+          # block 98304 is group 3, at 4 KiB blocks.
+          fsck.ext4 -fn -b 32768 -B 4096 /tmp/mg3.img
+          fsck.ext4 -fn -b 32768 -B 4096 /tmp/mg5.img
+          fsck.ext4 -fn -b 98304 -B 4096 /tmp/mg5.img
+          # The group table is where a short final group shows up: group 2 of
+          # mg3.img must end at the last block of the device (81919), not at
+          # a full group boundary.
+          dumpe2fs /tmp/mg3.img | grep -E '^Group [0-9]+:'
+          dumpe2fs /tmp/mg3.img | grep -q 'Group 2: (Blocks 65536-81919)'
       - name: Verify volume label and UUID round-tripped
         run: |
           # tune2fs prints the on-disk superblock metadata; grep confirms

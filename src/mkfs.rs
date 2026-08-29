@@ -32,6 +32,26 @@ const I_EXTRA_ISIZE: u16 = 32; // covers checksum_hi, ctime/mtime/atime extra, c
 const ROOT_MODE: u16 = 0o40755; // S_IFDIR | 0755
 const EXTENT_MAGIC: u16 = 0xF30A;
 
+/// Smallest filesystem block size this formatter will lay out.
+pub const MIN_BLOCK_SIZE: u32 = 1024;
+/// Largest filesystem block size this formatter will lay out.
+pub const MAX_BLOCK_SIZE: u32 = 65536;
+
+/// True if `block_size` is a block size a volume may be formatted with: a
+/// power of two in [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
+///
+/// Public because this rule has two enforcers and they must not drift. The
+/// formatter checks it on entry, which is the last line of defence. A caller
+/// that acquires resources before formatting — the `mkfs.ext4` CLI opens the
+/// target read-write and prints a "formatting" line — has to reject the same
+/// value *earlier*, and a second hand-written copy of "power of two,
+/// 1024..=65536" is one more thing to keep in step. There is one predicate,
+/// and both call it.
+#[must_use]
+pub fn is_valid_block_size(block_size: u32) -> bool {
+    block_size.is_power_of_two() && (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size)
+}
+
 /// Format `dev` as an ext4 filesystem (extents, 64-bit BGDs, metadata_csum,
 /// no journal). Thin wrapper over [`format_filesystem_with_flavor`] for
 /// callers that don't care about the dialect.
@@ -88,7 +108,7 @@ pub fn format_filesystem_with_flavor(
         0
     };
     const EXT3_JOURNAL_INODE: u32 = 8;
-    if !block_size.is_power_of_two() || !(1024..=65536).contains(&block_size) {
+    if !is_valid_block_size(block_size) {
         return Err(Error::InvalidArgument("mkfs: block_size out of range"));
     }
     if size_bytes < block_size as u64 * 64 {
@@ -1022,5 +1042,50 @@ fn write_root_inode(
             slot[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
             slot[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The block-size rule the CLI and the formatter share. Both spell it by
+    /// calling this, so what this test pins down is the rule itself.
+    #[test]
+    fn valid_block_sizes_are_powers_of_two_in_range() {
+        for bs in [1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            assert!(is_valid_block_size(bs), "{bs} should be accepted");
+        }
+        // Below the floor, above the ceiling, and — the case that motivated
+        // making this shared — in range but not a power of two.
+        for bs in [0, 1, 512, 1023, 3000, 4095, 4097, 131_072] {
+            assert!(!is_valid_block_size(bs), "{bs} should be rejected");
+        }
+    }
+
+    /// `format_block_groups` writes a superblock + GDT backup into exactly the
+    /// groups this predicate names, so the set it returns is on-disk layout.
+    /// Groups 0 and 1 are unconditional; after that it is the powers of 3, 5
+    /// and 7. A five-group volume therefore backs up into 0, 1 and 3 — which
+    /// is why `mkfs_4k_blocks_640m_sparse_super_backups` is sized at five.
+    #[test]
+    fn sparse_super_backups_land_in_powers_of_three_five_and_seven() {
+        let with_super: Vec<u64> = (0..60).filter(|g| group_has_super(*g)).collect();
+        assert_eq!(
+            with_super,
+            vec![0, 1, 3, 5, 7, 9, 25, 27, 49],
+            "sparse-super group set"
+        );
+    }
+
+    /// `set_bitmap_range` is how a short final group's off-the-end blocks get
+    /// marked in use, so the bit-for-bit result is what e2fsck ends up
+    /// reading. The range is half-open: `start` is set, `end` is not.
+    #[test]
+    fn set_bitmap_range_sets_a_half_open_run_of_bits() {
+        let mut bitmap = vec![0u8; 4];
+        set_bitmap_range(&mut bitmap, 3, 11);
+        // bits 3..11 → byte 0 keeps bits 0-2 clear, byte 1 has bits 0-2 set.
+        assert_eq!(bitmap, [0b1111_1000, 0b0000_0111, 0, 0]);
     }
 }
