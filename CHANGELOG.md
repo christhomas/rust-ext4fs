@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-29
+
 ### Fixes
 
 - **`mkfs.ext4 -c` no longer swallows the device path** — `-c` asks the standard
