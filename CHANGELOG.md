@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- **`mkfs.ext4 -c` no longer swallows the device path** — `-c` asks the standard
+  formatter for a bad-block scan and takes no argument, but it was listed among
+  the flags that consume the token after them. `mkfs.ext4 -c disk.img` therefore
+  read the image path as the value of `-c` and then failed with "missing
+  positional `<device>` argument" about the path it had just consumed.
+
+- **`mkfs.ext4 -b` rejects an unusable block size before opening the device** —
+  the power-of-two / 1 KiB..64 KiB rule was enforced only inside the formatter,
+  which runs after the device is opened read-write and after the tool has
+  printed that it is formatting it, so `-b 3000` looked like a format that had
+  failed part way through rather than a rejected argument. The rule now lives in
+  one predicate (`mkfs::is_valid_block_size`) that both the formatter and the
+  CLI call.
+
+- **`mkfs.ext4 -q` no longer depends on where it appears** — `quiet` was read
+  while the loop that sets it was still running, so `-q -m 1` was silent and
+  `-m 1 -q` was not.
+
+### Testing
+
+- The `mkfs_e2fsck_oracle` suite gains multi-group cases (320 MiB / three
+  groups with a short final group, and 640 MiB / five groups so a backup lands
+  in group 3 under the sparse-super powers-of-3 rule), and CI runs `fsck.ext4`
+  against both — including through their backup superblocks with `-b`. The
+  multi-group formatter path had previously been validated only by this crate's
+  own reader. It passes.
+
 ## [0.4.0] — 2026-06-30
 
 ### Features

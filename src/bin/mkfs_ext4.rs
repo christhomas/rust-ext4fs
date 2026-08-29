@@ -22,8 +22,27 @@
 //! Exit codes: 0 success, 1 any failure (matches the standard CLI convention).
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
-use fs_ext4::mkfs::format_filesystem;
+use fs_ext4::mkfs::{format_filesystem, is_valid_block_size, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE};
 use std::process::ExitCode;
+
+/// Standard-CLI flags this formatter accepts and ignores, each of which takes
+/// exactly one argument that we discard.
+///
+/// The split between this list and [`IGNORED_BOOLEAN_FLAGS`] is load-bearing,
+/// not cosmetic. A flag listed here consumes the token after it, so putting a
+/// boolean flag in this list makes it eat whatever came next — which, for a
+/// tool whose last argument is the device, is the device.
+const IGNORED_FLAGS_WITH_ARG: &[&str] = &["-m", "-N", "-i", "-E", "-O", "-T"];
+
+/// Standard-CLI flags this formatter accepts and ignores that take NO
+/// argument.
+///
+/// `-c` (check the device for bad blocks) is the reason this list exists. It
+/// used to sit in [`IGNORED_FLAGS_WITH_ARG`], so `mkfs.ext4 -c disk.img` read
+/// the image path as `-c`'s value, warned about a `-c disk.img` option nobody
+/// had written, and then failed with "missing positional <device> argument"
+/// about the path the caller had just given it.
+const IGNORED_BOOLEAN_FLAGS: &[&str] = &["-c"];
 
 const USAGE: &str = "\
 Usage: mkfs.ext4 [options] device
@@ -54,9 +73,10 @@ Positional:
                       truncate -s 64M out.img    (Linux/macOS)
                       fsutil file createnew out.img 67108864    (Windows)
 
-Unsupported flags from the standard CLI are accepted with a warning if they take an
-argument we can ignore safely (-m, -N, -i), and rejected as errors otherwise.
-The full feature set will land incrementally as the underlying crate grows.
+Unsupported flags from the standard CLI are accepted with a warning, and rejected
+as errors otherwise. Two groups, because they parse differently: -m, -N, -i, -E,
+-O and -T each consume the argument that follows them, while -c takes none. The
+full feature set will land incrementally as the underlying crate grows.
 ";
 
 fn main() -> ExitCode {
@@ -69,7 +89,7 @@ fn main() -> ExitCode {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Opts {
     label: Option<String>,
     block_size: Option<u32>,
@@ -83,10 +103,26 @@ struct Opts {
     /// devices — see the safety guard in `run()`.
     create_size: Option<u64>,
     device: Option<String>,
+    /// Warnings collected during the parse and printed once it is over.
+    ///
+    /// They are not printed as they are discovered because `-q` is itself a
+    /// flag: printing during the loop means `-q` only silences the flags that
+    /// happen to come after it, so `-m 1 -q` warned and `-q -m 1` did not.
+    /// Collecting first and acting second makes the parse order-independent.
+    warnings: Vec<String>,
 }
 
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
+
+    // Everything the parse wanted to say, now that the whole command line —
+    // including any `-q` at the end of it — has been read.
+    if !opts.quiet {
+        for warning in &opts.warnings {
+            eprintln!("mkfs.ext4: warning: {warning}");
+        }
+    }
+
     let device = opts
         .device
         .as_deref()
@@ -195,8 +231,17 @@ fn run() -> Result<(), String> {
 /// Parse CLI args. Hand-rolled to keep the dep tree at zero — pulling in
 /// clap just to handle ten flags would more than double the binary size.
 fn parse_args() -> Result<Opts, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// The parse itself, over any argument sequence.
+///
+/// Split from [`parse_args`] so the flag table can be tested without spawning
+/// a process: every argument-order and argument-consumption question this
+/// tool has got wrong is answerable here, in a unit test, against the same
+/// code the real command line goes through.
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, String> {
     let mut opts = Opts::default();
-    let mut args = std::env::args().skip(1).peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -227,6 +272,17 @@ fn parse_args() -> Result<Opts, String> {
                 let n: u32 = v
                     .parse()
                     .map_err(|_| format!("-b: not a valid number: {v}"))?;
+                // Reject here, not in the formatter. The formatter's check is
+                // the last line of defence and it fires after `run()` has
+                // opened the device read-write and announced that it is
+                // formatting it — so an unusable `-b` looked like a failure
+                // partway through a format rather than a rejected argument.
+                if !is_valid_block_size(n) {
+                    return Err(format!(
+                        "-b: block size must be a power of two in \
+                         {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE}, got {n}"
+                    ));
+                }
                 opts.block_size = Some(n);
             }
             "-U" => {
@@ -244,16 +300,19 @@ fn parse_args() -> Result<Opts, String> {
                 })?;
                 opts.create_size = Some(parse_size(&v)?);
             }
-            // Accepted-but-ignored standard-CLI flags. Each takes one argument.
-            // Warn on first encounter so users don't think the value was
-            // honored, but don't fail — keeps existing scripts portable.
-            "-m" | "-N" | "-i" | "-c" | "-E" | "-O" | "-T" => {
+            // Accepted-but-ignored standard-CLI flags. Warn so users don't
+            // think the value was honored, but don't fail — keeps existing
+            // scripts portable.
+            other if IGNORED_FLAGS_WITH_ARG.contains(&other) => {
                 let v = args
                     .next()
-                    .ok_or_else(|| format!("{arg} requires an argument"))?;
-                if !opts.quiet {
-                    eprintln!("mkfs.ext4: warning: {arg} {v} not yet honored, ignoring");
-                }
+                    .ok_or_else(|| format!("{other} requires an argument"))?;
+                opts.warnings
+                    .push(format!("{other} {v} not yet honored, ignoring"));
+            }
+            other if IGNORED_BOOLEAN_FLAGS.contains(&other) => {
+                opts.warnings
+                    .push(format!("{other} not yet honored, ignoring"));
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown flag: {other}\n\n{USAGE}"));
@@ -317,4 +376,93 @@ fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
             .map_err(|_| format!("UUID has non-hex character near position {}", i * 2))?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Opts, String> {
+        parse_args_from(argv.iter().map(|s| (*s).to_string()))
+    }
+
+    /// `-c` is "check for bad blocks" in the standard CLI and takes nothing.
+    /// Listed as argument-taking, it consumed the device path — so the tool
+    /// warned about an option the caller never wrote and then reported the
+    /// device missing. The parse must see a device here.
+    #[test]
+    fn dash_c_is_boolean_and_leaves_the_device_alone() {
+        let opts = parse(&["-c", "/tmp/disk.img"]).expect("parse");
+        assert_eq!(opts.device.as_deref(), Some("/tmp/disk.img"));
+        assert_eq!(opts.warnings.len(), 1, "one ignored-flag warning");
+        assert!(opts.warnings[0].starts_with("-c "), "{:?}", opts.warnings);
+    }
+
+    /// The other half of the same rule: flags that really do take an argument
+    /// must still swallow it, or their value becomes the device path.
+    #[test]
+    fn argument_taking_ignored_flags_consume_their_value() {
+        for &flag in IGNORED_FLAGS_WITH_ARG {
+            let opts = parse(&[flag, "1", "/tmp/disk.img"]).expect("parse");
+            assert_eq!(
+                opts.device.as_deref(),
+                Some("/tmp/disk.img"),
+                "{flag} should have eaten its own value, not the device"
+            );
+            assert_eq!(
+                opts.warnings,
+                vec![format!("{flag} 1 not yet honored, ignoring")]
+            );
+        }
+    }
+
+    /// A flag that takes an argument and is given none is still an error —
+    /// silently treating the end of the command line as an empty value would
+    /// hide a typo.
+    #[test]
+    fn argument_taking_ignored_flag_without_a_value_is_an_error() {
+        let err = parse(&["-m"]).expect_err("should reject");
+        assert!(err.contains("-m requires an argument"), "{err}");
+    }
+
+    /// The block size has to be rejected by the parser, because the caller
+    /// after it opens the device read-write and prints "formatting" before
+    /// the formatter's own check ever runs.
+    #[test]
+    fn out_of_range_block_size_is_rejected_at_parse_time() {
+        for bad in ["3000", "512", "131072", "0"] {
+            let err = parse(&["-b", bad, "/tmp/disk.img"])
+                .expect_err("out-of-range block size should be rejected");
+            assert!(
+                err.starts_with("-b: block size must be a power of two"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_range_block_sizes_parse() {
+        for good in ["1024", "4096", "65536"] {
+            let opts = parse(&["-b", good, "/tmp/disk.img"]).expect("parse");
+            assert_eq!(opts.block_size, Some(good.parse().unwrap()));
+        }
+    }
+
+    /// `-q` used to be read while the loop that sets it was still running, so
+    /// it silenced only what came after it. The parse now just records; the
+    /// same options must come out whichever end of the line `-q` sits at.
+    #[test]
+    fn quiet_is_independent_of_flag_order() {
+        let early = parse(&["-q", "-m", "1", "/tmp/disk.img"]).expect("parse");
+        let late = parse(&["-m", "1", "-q", "/tmp/disk.img"]).expect("parse");
+        assert!(early.quiet && late.quiet);
+        assert_eq!(early.warnings, late.warnings);
+        assert_eq!(early.warnings.len(), 1);
+    }
+
+    #[test]
+    fn unknown_flags_are_still_rejected() {
+        let err = parse(&["-Z", "/tmp/disk.img"]).expect_err("should reject");
+        assert!(err.starts_with("unknown flag: -Z"), "{err}");
+    }
 }

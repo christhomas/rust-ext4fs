@@ -204,3 +204,124 @@ fn mkfs_bin_dry_run_does_not_modify_file() {
 
     let _ = std::fs::remove_file(&img);
 }
+
+// ---------------------------------------------------------------------------
+// Flag-parsing behaviour, checked through the built binary.
+//
+// The unit tests inside src/bin/mkfs_ext4.rs cover the parse table directly.
+// These three exist because each of the bugs below was found by running the
+// binary and reading what it printed, and what it printed is the part a
+// caller actually experiences.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mkfs_bin_dash_c_does_not_swallow_the_device_path() {
+    // `-c` is boolean in the standard CLI. Parsed as argument-taking, it ate
+    // the image path and the tool then reported "missing positional <device>
+    // argument" — about the path it had just consumed.
+    let bin = env!("CARGO_BIN_EXE_mkfs_ext4");
+    let img = unique_tmp_path("dashc");
+    let img_str = img.to_string_lossy().into_owned();
+    {
+        let f = std::fs::File::create(&img).expect("create img");
+        f.set_len(SIZE_BYTES).expect("set_len");
+    }
+
+    // -n so this stays a parse test and writes nothing.
+    let out = Command::new(bin)
+        .args(["-n", "-c", &img_str])
+        .output()
+        .expect("spawn mkfs_ext4 -n -c");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(
+        out.status.success(),
+        "-c must not consume the device path; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("missing positional"),
+        "device path was swallowed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("-c not yet honored"),
+        "-c should still warn that it is ignored; stderr:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn mkfs_bin_rejects_bad_block_size_before_opening_the_device() {
+    // `-b 3000` is not a power of two. It used to be caught by the formatter,
+    // which runs after the device is open read-write and after the tool has
+    // printed that it is formatting — so a rejected argument read as a format
+    // that failed halfway.
+    let bin = env!("CARGO_BIN_EXE_mkfs_ext4");
+    let img = unique_tmp_path("badbs");
+    let img_str = img.to_string_lossy().into_owned();
+    let pattern = vec![0xAAu8; SIZE_BYTES as usize];
+    std::fs::write(&img, &pattern).expect("seed pattern");
+
+    let out = Command::new(bin)
+        .args(["-b", "3000", &img_str])
+        .output()
+        .expect("spawn mkfs_ext4 -b 3000");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(!out.status.success(), "-b 3000 must fail");
+    assert!(
+        stderr.contains("block size must be a power of two"),
+        "should name the rule it broke; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("formatting"),
+        "must not announce a format it never intended to start; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&img).expect("read after rejected -b"),
+        pattern,
+        "a rejected argument must leave the device untouched"
+    );
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn mkfs_bin_quiet_silences_warnings_from_either_side() {
+    // `-q` was read during the parse loop, so it only silenced flags that
+    // came after it: `-q -m 1` was quiet and `-m 1 -q` was not.
+    let bin = env!("CARGO_BIN_EXE_mkfs_ext4");
+    let img = unique_tmp_path("quiet");
+    let img_str = img.to_string_lossy().into_owned();
+    {
+        let f = std::fs::File::create(&img).expect("create img");
+        f.set_len(SIZE_BYTES).expect("set_len");
+    }
+
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(bin).args(args).output().expect("spawn");
+        assert!(out.status.success(), "{args:?} should succeed");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let quiet_first = run(&["-n", "-q", "-m", "1", &img_str]);
+    let quiet_last = run(&["-n", "-m", "1", "-q", &img_str]);
+    assert_eq!(
+        quiet_first, quiet_last,
+        "-q must not depend on where it appears"
+    );
+    assert!(
+        quiet_first.is_empty(),
+        "-q should silence the ignored-flag warning; got:\n{quiet_first}"
+    );
+
+    // And without -q the warning is still there — otherwise the test above
+    // would pass just as well on a tool that never warns at all.
+    let loud = run(&["-n", "-m", "1", &img_str]);
+    assert!(
+        loud.contains("-m 1 not yet honored"),
+        "warning should appear without -q; got:\n{loud}"
+    );
+
+    let _ = std::fs::remove_file(&img);
+}
