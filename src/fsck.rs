@@ -1010,12 +1010,8 @@ fn repair_duplicate_dir_inode(
             };
             if dir::remove_entry_from_block(block, name.as_bytes(), has_ft, reserved_tail)? {
                 if fs.csum.enabled && reserved_tail == 12 {
-                    let end = block.len();
-                    let mut c =
-                        crate::checksum::linux_crc32c(fs.csum.seed, &parent_ino.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    fs.csum
+                        .patch_dir_entry_tail(*parent_ino, parent_inode.generation, block);
                 }
                 removed = true;
                 break;
@@ -1176,11 +1172,8 @@ fn repair_wrong_dotdot(
     // Recompute the dir block CRC if metadata_csum reserved a tail.
     // Same recipe as repair_duplicate_dir_inode — see comments there.
     if fs.csum.enabled && reserved_tail == 12 {
-        let end = block.len();
-        let mut c = crate::checksum::linux_crc32c(fs.csum.seed, &dir_ino.to_le_bytes());
-        c = crate::checksum::linux_crc32c(c, &dir_inode.generation.to_le_bytes());
-        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        fs.csum
+            .patch_dir_entry_tail(dir_ino, dir_inode.generation, block);
     }
 
     fs.commit_block_buffer(buf)?;
@@ -1302,11 +1295,8 @@ fn repair_bogus_entry(
         if let Some(off) = hit_off {
             block[off + 7] = child_filetype as u8;
             if fs.csum.enabled && reserved_tail == 12 {
-                let end = block.len();
-                let mut c = crate::checksum::linux_crc32c(fs.csum.seed, &parent_ino.to_le_bytes());
-                c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                fs.csum
+                    .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
             }
             found = true;
             break;

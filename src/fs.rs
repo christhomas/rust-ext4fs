@@ -1642,12 +1642,8 @@ impl Filesystem {
             };
             if crate::dir::remove_entry_from_block(block, name, has_ft, reserved_tail)? {
                 if self.csum.enabled && reserved_tail == 12 {
-                    let end = block.len();
-                    let mut c =
-                        crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    self.csum
+                        .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
                 }
                 return Ok(());
             }
@@ -1674,11 +1670,8 @@ impl Filesystem {
         }
         block[12..16].copy_from_slice(&new_parent_ino.to_le_bytes());
         if self.csum.enabled && crate::dir::has_csum_tail(block) {
-            let end = block.len();
-            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &dir_ino.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &dir_inode.generation.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+            self.csum
+                .patch_dir_entry_tail(dir_ino, dir_inode.generation, block);
         }
         Ok(())
     }
@@ -1724,17 +1717,8 @@ impl Filesystem {
             ) {
                 Ok(()) => {
                     if self.csum.enabled && reserved_tail == 12 {
-                        let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(
-                            self.csum.seed,
-                            &parent_ino.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(
-                            c,
-                            &parent_inode.generation.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                        self.csum
+                            .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
                     }
                     return Ok(());
                 }
@@ -2265,14 +2249,8 @@ impl Filesystem {
             )? {
                 // Recompute the tail csum if present — entry-list shape changed.
                 if self.csum.enabled && reserved_tail == 12 {
-                    let end = block.len();
-                    let mut c = crate::checksum::linux_crc32c(
-                        self.csum.seed,
-                        &parent_ino_num.to_le_bytes(),
-                    );
-                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    self.csum
+                        .patch_dir_entry_tail(parent_ino_num, parent_inode.generation, block);
                 }
                 removed = true;
                 break;
@@ -3841,16 +3819,8 @@ impl Filesystem {
         // Tail (when metadata_csum enabled): fake inode=0, rec_len=12,
         // name_len=0, file_type=0xDE, u32 checksum.
         if reserved_tail == 12 {
-            let tail = bs - 12;
-            block[tail..tail + 4].copy_from_slice(&0u32.to_le_bytes()); // inode=0
-            block[tail + 4..tail + 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
-            block[tail + 6] = 0; // name_len
-            block[tail + 7] = 0xDE; // file_type marker
-                                    // CRC32C over [0 .. bs - 12] salted by ino + gen.
-            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &new_ino.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &new_generation.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[..bs - 12]);
-            block[bs - 4..bs].copy_from_slice(&c.to_le_bytes());
+            self.csum
+                .patch_dir_entry_tail(new_ino, new_generation, &mut block);
         }
 
         Ok(block)
@@ -4533,17 +4503,11 @@ impl Filesystem {
             ) {
                 Ok(()) => {
                     if self.csum.enabled && reserved_tail == 12 {
-                        let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(
-                            self.csum.seed,
-                            &parent_ino.to_le_bytes(),
+                        self.csum.patch_dir_entry_tail(
+                            parent_ino,
+                            parent_inode.generation,
+                            &mut block,
                         );
-                        c = crate::checksum::linux_crc32c(
-                            c,
-                            &parent_inode.generation.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
                     }
                     self.dev.write_at(phys * bs as u64, &block)?;
                     return Ok(());
@@ -4756,15 +4720,8 @@ impl Filesystem {
         )?;
 
         if self.csum.enabled && reserved_tail == 12 {
-            let end = block.len();
-            block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes());
-            block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes());
-            block[end - 6] = 0;
-            block[end - 5] = 0xDE;
-            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+            self.csum
+                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
         }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
@@ -4893,15 +4850,8 @@ impl Filesystem {
             reserved_tail,
         )?;
         if self.csum.enabled && reserved_tail == 12 {
-            let end = block.len();
-            block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes());
-            block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes());
-            block[end - 6] = 0;
-            block[end - 5] = 0xDE;
-            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+            self.csum
+                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
         }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
@@ -5038,15 +4988,8 @@ impl Filesystem {
         )?;
 
         if self.csum.enabled && reserved_tail == 12 {
-            let end = block.len();
-            block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes());
-            block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes());
-            block[end - 6] = 0;
-            block[end - 5] = 0xDE;
-            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+            self.csum
+                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
         }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
@@ -5076,12 +5019,8 @@ impl Filesystem {
             };
             if crate::dir::remove_entry_from_block(&mut block, name, has_ft, reserved_tail)? {
                 if self.csum.enabled && reserved_tail == 12 {
-                    let end = block.len();
-                    let mut c =
-                        crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    self.csum
+                        .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
                 }
                 self.dev.write_at(phys * bs as u64, &block)?;
                 return Ok(());
@@ -5106,11 +5045,8 @@ impl Filesystem {
         block[12..16].copy_from_slice(&new_parent_ino.to_le_bytes());
 
         if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-            let end = block.len();
-            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &dir_ino.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &dir_inode.generation.to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+            self.csum
+                .patch_dir_entry_tail(dir_ino, dir_inode.generation, &mut block);
         }
         self.dev.write_at(phys * bs as u64, &block)?;
         Ok(())
@@ -5211,12 +5147,8 @@ impl Filesystem {
                 reserved_tail,
             )? {
                 if self.csum.enabled && reserved_tail == 12 {
-                    let end = block.len();
-                    let mut c =
-                        crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
-                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    self.csum
+                        .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
                 }
                 removed = true;
                 break;

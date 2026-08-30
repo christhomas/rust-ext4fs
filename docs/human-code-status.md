@@ -120,6 +120,72 @@ delta fails `a_cross_parent_directory_replace_leaves_the_destination_parent_unch
 
 Still open.
 
+### X1 — the dir-entry tail checksum, hand-rolled at sixteen sites — **fixed**
+
+`Checksummer` had `patch_extent_tail` and `patch_xattr_block`. It had no
+`patch_dir_entry_tail`, so the recipe written most often was the one with no
+helper: plant a fake dirent (`inode = 0`, `rec_len = 12`, `name_len = 0`,
+`file_type = 0xDE`), then `crc32c(seed → ino → generation → block[..len - 12])`.
+
+**The report said nine sites. There are sixteen** — twelve in `fs.rs`, three in
+`fsck.rs`, one in `mkfs.rs`, plus a seventeenth in the test suite. In two
+addressing idioms (`bs - 12` with `+4/+6/+7`, and `block.len()` with
+`-8/-6/-5`) a reader has to prove equivalent at each one.
+
+#### What probing the coverage found
+
+Before changing anything, each site's CRC span was corrupted (`end - 12` →
+`end - 4`) to see which were held down by a test:
+
+| site | tests failing, before |
+|---|---|
+| `seed_directory_block` (`apply_mkdir`) | **0** |
+| `extend_dir_and_add_entry` | **0** |
+| `extend_dir_and_add_entry_deep` | **0** |
+| `extend_dir_and_add_entry_depth1` | **0** |
+| `fsck::repair_wrong_dotdot` | **0** |
+| `fsck` remove-entry | **0** |
+| `fsck` bogus-filetype | **0** |
+
+Not even the tests that verify dir-block checksums caught it: they check the
+blocks `mkfs` wrote, not the ones the driver writes afterwards. A wrong tail
+raises no error here — it surfaces when Linux mounts the volume and calls the
+directory corrupt.
+
+One of the misses is worth its own note. The first version of the growth test
+created 200 files and then looked, and still saw nothing: **every later in-place
+add rewrites the same block and recomputes its checksum at a different site**, so
+a wrong checksum from the extension path is overwritten by a right one. The test
+now stops on the create that grew the directory, so the extension path's write is
+the last thing to touch the new block.
+
+#### What is there now
+
+`tests/dir_block_checksums_after_writes.rs` — five tests that, after mkdir,
+create, unlink, rename and directory growth, walk every directory block reachable
+from the root and verify its tail against `verify_dir_entry_tail`. It counts what
+it checked and asserts the count, because an assertion that silently checks
+nothing is the failure mode the file is about.
+
+`Checksummer::patch_dir_entry_tail` replaces all sixteen. Planting is idempotent,
+so the sites that only needed the checksum recomputed use it too rather than
+keeping a second recipe. `DIR_ENTRY_TAIL_FILE_TYPE` names the `0xDE` marker.
+
+Mutating the single helper's CRC span now fails **12 tests across three suites**.
+Mutating the marker byte fails 9.
+
+**The copy in `tests/fsck_wrong_dotdot.rs` is deliberately left alone.** A test
+that computed the checksum through the helper would agree with a broken helper;
+an independent restatement of the recipe is what makes it an oracle.
+
+#### Still uncovered
+
+The two htree variants (`extend_dir_and_add_entry_deep` / `_depth1`) and the
+three `fsck.rs` repair sites are not reached by any test — but they now call the
+same helper as everything else, so the recipe itself is covered even where the
+call sites are not. Reaching them needs an htree directory and repair-side
+fixtures.
+
 ### H1, H3, M4 — `fs.rs` at 5,258 lines; `apply_pwrite` 354 and `apply_rename` 327; 341 lines indented past column 24
 
 All three **regressed** since the previous review, which the report notes. They

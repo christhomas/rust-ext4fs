@@ -45,6 +45,13 @@ pub struct Checksummer {
     pub enabled: bool,
 }
 
+/// `file_type` of the fake dirent that ends a checksummed directory
+/// block — `EXT4_FT_DIR_CSUM` in e2fsprogs.
+///
+/// Not a real file type: it is out of range for one, which is how a
+/// reader tells the tail apart from an entry.
+pub const DIR_ENTRY_TAIL_FILE_TYPE: u8 = 0xDE;
+
 impl Checksummer {
     /// Derive the checksum context from a parsed superblock.
     ///
@@ -146,6 +153,55 @@ impl Checksummer {
         c = linux_crc32c(c, &generation.to_le_bytes());
         c = linux_crc32c(c, &block[..end - 12]);
         c == stored
+    }
+
+    /// Plant the `ext4_dir_entry_tail` and checksum a directory block.
+    ///
+    /// The mirror of [`Self::verify_dir_entry_tail`], and the sibling
+    /// that was missing: `patch_extent_tail` and `patch_xattr_block`
+    /// both existed, so the one recipe written most often was the one
+    /// with no helper. It was hand-rolled at **sixteen** sites across
+    /// `fs.rs`, `fsck.rs`, `mkfs.rs` and the tests, in two different
+    /// addressing idioms (`bs - 12` with `+4/+6/+7`, and
+    /// `block.len()` with `-8/-6/-5`) that a reader has to prove
+    /// equivalent at each one.
+    ///
+    /// The tail is a **fake directory entry** occupying the last 12
+    /// bytes: `inode = 0` so no scan mistakes it for a real one,
+    /// `rec_len = 12` so a walk steps over it, `name_len = 0`, and
+    /// `file_type = 0xDE` as the marker `has_csum_tail` looks for. The
+    /// CRC then covers `block[..len - 12]` — the whole block *except*
+    /// the tail entry, which is what separates this from
+    /// [`Self::patch_extent_tail`], where only the trailing 4 bytes are
+    /// excluded.
+    ///
+    /// Planting is idempotent: a block that already carries the tail
+    /// gets the same twelve bytes back, so callers that only need the
+    /// checksum recomputed can use this too rather than keeping a
+    /// second recipe for that case.
+    ///
+    /// Every constant here has to agree with e2fsprogs, and a
+    /// disagreement produces no error until the volume is mounted
+    /// somewhere else — which is the argument for there being one copy
+    /// of them.
+    ///
+    /// No-op when checksums are disabled or the block is under 12
+    /// bytes; returns true when it patched.
+    pub fn patch_dir_entry_tail(&self, ino: u32, generation: u32, block: &mut [u8]) -> bool {
+        if !self.enabled || block.len() < 12 {
+            return false;
+        }
+        let end = block.len();
+        block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // inode = 0
+        block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
+        block[end - 6] = 0; // name_len
+        block[end - 5] = DIR_ENTRY_TAIL_FILE_TYPE;
+
+        let mut c = linux_crc32c(self.seed, &ino.to_le_bytes());
+        c = linux_crc32c(c, &generation.to_le_bytes());
+        c = linux_crc32c(c, &block[..end - 12]);
+        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        true
     }
 
     /// Verify an extent-block tail checksum.
