@@ -238,8 +238,22 @@ impl Checksummer {
     /// Verify a parsed inode's checksum.
     /// Chained: seed → ino_le → gen_le → inode_bytes (with checksum slots zeroed).
     pub fn verify_inode(&self, ino: u32, generation: u32, inode_raw: &[u8]) -> bool {
-        if !self.enabled || inode_raw.len() < 128 {
+        if !self.enabled {
             return true;
+        }
+        // A truncated read is a refusal, not a pass — the same answer
+        // `verify_superblock`, `verify_dir_entry_tail` and
+        // `verify_extent_tail` give, and for the same reason: the
+        // caller got fewer bytes than it asked for, so a checksum
+        // computed here would cover bytes that are not the ones on
+        // disk. Reporting `true` says an inode verified when nothing
+        // verified it.
+        //
+        // This used to read `if !self.enabled || inode_raw.len() < 128`,
+        // one `||` instead of two `if`s — a difference invisible unless
+        // you read all four verifiers together.
+        if inode_raw.len() < crate::inode::GOOD_OLD_INODE_SIZE {
+            return false;
         }
         let stored_lo = u16::from_le_bytes(inode_raw[0x7C..0x7E].try_into().unwrap()) as u32;
         let stored_hi = if inode_raw.len() >= 0x84 {
@@ -324,7 +338,7 @@ impl Checksummer {
         generation: u32,
         inode_raw: &[u8],
     ) -> Option<(u16, u16)> {
-        if !self.enabled || inode_raw.len() < 128 {
+        if !self.enabled || inode_raw.len() < crate::inode::GOOD_OLD_INODE_SIZE {
             return None;
         }
         // i_checksum_hi (0x82) is part of the checksum only when i_extra_isize
@@ -357,6 +371,89 @@ impl Checksummer {
 
 #[cfg(test)]
 mod tests {
+
+    // --- a short buffer is a refusal, on every verifier ------------------
+    //
+    // Written before the fix. `verify_inode` passed a truncated buffer;
+    // its three siblings refused one. Nothing in the crate noticed the
+    // difference, because the short-buffer axis had no coverage at all.
+
+    /// A checksummer that is switched on, with an arbitrary seed.
+    fn enabled() -> Checksummer {
+        Checksummer {
+            enabled: true,
+            seed: 0xDEAD_BEEF,
+        }
+    }
+
+    /// Every verifier refuses a buffer too short to hold the field it
+    /// checks.
+    ///
+    /// This is a policy, not four separate decisions, and it is the
+    /// safe direction: a truncated read means the caller got less than
+    /// it asked for, and the checksum it would compute covers bytes
+    /// that are not the ones on disk. Returning `true` there reports a
+    /// structure as verified when nothing verified it.
+    ///
+    /// Asserted as a set so a fifth verifier cannot quietly pick the
+    /// other answer — which is exactly how `verify_inode` came to
+    /// differ from the other three.
+    #[test]
+    fn every_verifier_refuses_a_buffer_too_short_to_check() {
+        let c = enabled();
+        assert!(
+            !c.verify_superblock(&[0u8; 64]),
+            "superblock: a 64-byte buffer cannot hold a checksum at 0x3FC"
+        );
+        assert!(
+            !c.verify_dir_entry_tail(2, 0, &[0u8; 8]),
+            "dir entry tail: an 8-byte buffer cannot hold a 12-byte tail"
+        );
+        assert!(
+            !c.verify_extent_tail(2, 0, &[0u8; 2]),
+            "extent tail: a 2-byte buffer cannot hold a 4-byte checksum"
+        );
+        assert!(
+            !c.verify_inode(2, 0, &[0u8; 64]),
+            "inode: a 64-byte buffer cannot hold a checksum at 0x7C"
+        );
+    }
+
+    /// And every one of them still passes everything when checksums are
+    /// off, short buffer included.
+    ///
+    /// The two conditions are separate for a reason: "we do not check"
+    /// and "we checked and it failed" are different answers, and a
+    /// filesystem without `metadata_csum` must not start failing reads
+    /// because a buffer was short.
+    #[test]
+    fn a_disabled_checksummer_passes_even_a_short_buffer() {
+        let c = Checksummer {
+            enabled: false,
+            seed: 0,
+        };
+        assert!(c.verify_superblock(&[0u8; 4]));
+        assert!(c.verify_dir_entry_tail(2, 0, &[0u8; 4]));
+        assert!(c.verify_extent_tail(2, 0, &[0u8; 1]));
+        assert!(c.verify_inode(2, 0, &[0u8; 4]));
+    }
+
+    /// The boundary itself: 127 bytes is refused, 128 is checked.
+    ///
+    /// 128 is where `verify_inode`'s own field lives — `i_checksum_lo`
+    /// at 0x7C..0x7E — so a buffer one byte shorter cannot hold it.
+    #[test]
+    fn the_inode_length_boundary_is_where_the_field_ends() {
+        let c = enabled();
+        assert!(!c.verify_inode(2, 0, &[0u8; 127]), "127 is too short");
+        // 128 bytes of zeros is a real check that simply fails: the
+        // stored checksum is zero and the computed one is not.
+        assert!(
+            !c.verify_inode(2, 0, &[0u8; 128]),
+            "128 is checked, and all-zero bytes do not verify"
+        );
+    }
+
     use super::*;
 
     #[test]

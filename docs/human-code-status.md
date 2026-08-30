@@ -186,6 +186,68 @@ same helper as everything else, so the recipe itself is covered even where the
 call sites are not. Reaching them needs an htree directory and repair-side
 fixtures.
 
+### D5 — `verify_inode` failed open where every sibling failed closed — **fixed**
+
+```rust
+if !self.enabled || inode_raw.len() < 128 {
+    return true;          // a truncated inode silently verifies
+```
+
+`verify_superblock`, `verify_dir_entry_tail` and `verify_extent_tail` all split
+the two conditions and `return false` on a short buffer. One `||` against two
+`if`s, invisible unless you read all four.
+
+It is the unsafe direction: a truncated read means the caller got fewer bytes
+than it asked for, so a checksum computed there covers bytes that are not the
+ones on disk. Returning `true` reports an inode as verified when nothing
+verified it.
+
+**The short-buffer axis had no coverage at all** — flipping the behaviour before
+writing the tests failed nothing in the crate.
+
+Three tests, written first and red on `verify_inode` alone. The first asserts the
+policy across **all four** verifiers as a set, so a fifth cannot quietly pick the
+other answer — which is exactly how this one came to differ. The second pins that
+a disabled checksummer still passes everything, short buffers included: "we do
+not check" and "we checked and it failed" are different answers. The third pins
+the boundary at 128.
+
+### D4 — dead code behind a crate-wide `allow` — **fixed, and it was a chain**
+
+The report named three dead functions. Removing `#![allow(dead_code)]` found
+**six**, plus a constant and two fields — and removing one of those fields
+surfaced a variable that existed only to feed it.
+
+| removed | lines |
+|---|---|
+| `commit_block_alloc`, `free_inode_slot`, `mark_inode_used`, `add_dir_entry`, `remove_dir_entry`, `update_dotdot` | 176 |
+| `CachingDevice`, its `CacheState`, its impls and its five tests | 341 |
+| `PathFrame::idx_in_parent`, `chosen_pos`, `BlockBuffer::block_size` | ~15 |
+
+**`CachingDevice` never appeared in a single warning**, because `pub` in a
+`pub mod` is never dead to the compiler. That is why ~341 lines of a weaker
+duplicate survived beside the live `block_cache::CachedDevice`, with a private
+`CacheState` colliding by name with the live one.
+
+Two of the removals turned into something better than a deletion:
+
+- `EXT4_GOOD_OLD_INODE_SIZE = 128` was declared in `mkfs.rs` and unused, while
+  `checksum.rs` wrote the bare `128` twice — including at the boundary D5 is
+  about. It is now `inode::GOOD_OLD_INODE_SIZE`, used at both sites, and its doc
+  says what the number means: the length below which an inode cannot hold
+  `i_checksum_lo` at 0x7C.
+- `CountingDevice::writes()` was a test helper with no caller. Nothing asserted
+  the block cache is write-through, so it now has a test rather than a deletion.
+
+`BlockBuffer::new` keeps its `block_size` parameter although the field is gone:
+twenty-four call sites pass it, and it says at each one which filesystem's blocks
+these are. A dead field is worth removing; twenty-four less legible calls are not
+worth buying with it.
+
+**`#![allow(dead_code)]` is gone.** That is the part that lasts — without it the
+next dead function is invisible again. `cargo clippy --all-targets -- -D warnings`
+is clean without it.
+
 ### H1, H3, M4 — `fs.rs` at 5,258 lines; `apply_pwrite` 354 and `apply_rename` 327; 341 lines indented past column 24
 
 All three **regressed** since the previous review, which the report notes. They

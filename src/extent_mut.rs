@@ -357,18 +357,21 @@ pub struct DeepInsertPlan {
     pub allocated_blocks: Vec<u64>,
 }
 
-/// One frame on the descent path: the block we read, its raw bytes, and the
-/// index entry inside its parent that pointed at it. The root frame uses
-/// `block = 0` and `idx_in_parent = 0` purely as placeholders — root is
-/// recognized by its position (the first frame) rather than by these fields.
+/// One frame on the descent path: the block we read and its raw bytes.
+///
+/// The root frame uses `block = 0` as a placeholder — root is recognised
+/// by its position (the first frame) rather than by the field.
+///
+/// It also carried `idx_in_parent`, the position of the index entry in
+/// the parent that selected this child. Every construction site set it
+/// and nothing ever read it; the crate-wide `allow(dead_code)` is what
+/// kept that invisible. If a rebalance ever needs to rewrite a parent's
+/// entry in place, it comes back — as a field something reads.
 struct PathFrame {
     /// Block number of this node. `0` if this is the inline root.
     block: u64,
     /// Raw bytes (60 for root, `block_size` for everything below).
     bytes: Vec<u8>,
-    /// Position of the index entry inside the parent that selected this
-    /// child. `0` for the root frame (no parent).
-    idx_in_parent: usize,
 }
 
 /// Encode a 12-byte index entry pointing at `child_phys` for the subtree
@@ -573,7 +576,6 @@ fn descend_to_leaf(
     path.push(PathFrame {
         block: 0,
         bytes: root_bytes.to_vec(),
-        idx_in_parent: 0,
     });
 
     loop {
@@ -589,13 +591,11 @@ fn descend_to_leaf(
         }
         // Find largest index entry whose ei_block <= target_logical (mirrors
         // the read-side descent in extent::lookup_verified).
-        let mut chosen_pos: usize = 0;
         let mut chosen_idx: Option<ExtentIdx> = None;
         for i in 0..header.entries {
             let off = extent_entry_offset(i as usize);
             let idx = ExtentIdx::parse(&frame.bytes[off..off + EXT4_EXT_NODE_SIZE])?;
             if idx.logical_block <= target_logical {
-                chosen_pos = i as usize;
                 chosen_idx = Some(idx);
             } else {
                 break;
@@ -615,7 +615,6 @@ fn descend_to_leaf(
         path.push(PathFrame {
             block: idx.leaf_block,
             bytes: child_buf,
-            idx_in_parent: chosen_pos,
         });
     }
 }

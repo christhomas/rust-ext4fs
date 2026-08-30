@@ -12,6 +12,18 @@ use crate::error::{Error, Result};
 
 /// Minimum on-disk inode size (rev 0).
 pub const INODE_BASE_SIZE: usize = 128;
+/// The size of the original ext2 inode — `EXT2_GOOD_OLD_INODE_SIZE`.
+///
+/// Everything up to here is the fixed part every ext2/3/4 inode has;
+/// anything past it is the `i_extra_isize` region, which only larger
+/// inodes carry. So it is the length below which an inode buffer cannot
+/// hold `i_checksum_lo` at 0x7C, and the point at which
+/// `Checksummer::verify_inode` refuses.
+///
+/// It was declared in `mkfs.rs`, unused, while `checksum.rs` wrote the
+/// bare `128` twice.
+pub const GOOD_OLD_INODE_SIZE: usize = 128;
+
 /// Offset where the i_extra_isize field begins (start of extra section).
 pub const INODE_EXTRA_OFFSET: usize = 128;
 
