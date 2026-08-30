@@ -395,6 +395,15 @@ mod tests {
         cached.read_at(0, &mut buf).unwrap();
         assert_eq!(inner.reads(), 2);
         assert_eq!(buf[0], 42, "post-write read should see the new bytes");
+        // The cache is write-through, not write-back: the bytes reach
+        // the device now, exactly once. Nothing asserted this before —
+        // `CountingDevice::writes()` existed and had no caller, which is
+        // what the crate-wide `allow(dead_code)` was hiding.
+        assert_eq!(
+            inner.writes(),
+            1,
+            "an unaligned write must reach the device once, not be held in cache"
+        );
     }
 
     #[test]

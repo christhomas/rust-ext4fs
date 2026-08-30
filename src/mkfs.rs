@@ -27,7 +27,6 @@ use crate::features::{Compat, FsFlavor, Incompat, RoCompat};
 const EXT4_MAGIC: u16 = 0xEF53;
 const EXT4_VALID_FS: u16 = 0x0001;
 const EXT4_ROOT_INO: u32 = 2;
-const EXT4_GOOD_OLD_INODE_SIZE: u16 = 128;
 const I_EXTRA_ISIZE: u16 = 32; // covers checksum_hi, ctime/mtime/atime extra, crtime
 const ROOT_MODE: u16 = 0o40755; // S_IFDIR | 0755
 const EXTENT_MAGIC: u16 = 0xF30A;

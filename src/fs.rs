@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 /// blocks in journal-stored order, matching the kernel's expected
 /// transaction layout.
 pub(crate) struct BlockBuffer {
-    pub block_size: u32,
     pub dirty: BTreeMap<u64, Vec<u8>>,
     /// Uninit flags this buffer clears, and the descriptor flags they
     /// leave behind, held until the buffer is committed.
@@ -34,9 +33,16 @@ pub(crate) struct BlockBuffer {
 }
 
 impl BlockBuffer {
-    pub fn new(block_size: u32) -> Self {
+    /// `block_size` is taken and not stored.
+    ///
+    /// It was a field nothing read — every block this buffer holds
+    /// arrives already sized by the caller, so the buffer never needs
+    /// to know. The parameter stays because twenty-four call sites pass
+    /// it and it says at each one which filesystem's blocks these are;
+    /// dropping it would trade a dead field for twenty-four edits and a
+    /// less legible call.
+    pub fn new(_block_size: u32) -> Self {
         Self {
-            block_size,
             dirty: BTreeMap::new(),
             uninit_cleared: BTreeMap::new(),
         }
@@ -3457,28 +3463,6 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Mark `len` bits starting at block `start` as USED in the containing
-    /// block group's bitmap. Mirrors `free_block_run` but sets rather than
-    /// clears. Assumes the run lies entirely within one group (same caveat).
-    /// Phase 1.2: Apply a `BlockAllocationPlan` end-to-end on the un-
-    /// journaled path — bitmap mark + BGD counter patch + SB counter
-    /// patch in one call. Used by ops that haven't been migrated to the
-    /// BlockBuffer pattern yet (apply_create's data write, etc.); the
-    /// journaled path uses `buffer_mark_block_run_used` +
-    /// `buffer_patch_bgd_counters` + `buffer_patch_sb_counters`
-    /// against a `BlockBuffer` instead.
-    fn commit_block_alloc(&self, plan: &crate::alloc::BlockAllocationPlan) -> Result<()> {
-        self.set_block_run_used(plan.first_block, plan.count as u64)?;
-        self.patch_bgd_counters(
-            plan.bgd.group_idx as usize,
-            plan.bgd.free_blocks_delta,
-            plan.bgd.free_inodes_delta,
-            plan.bgd.used_dirs_delta,
-        )?;
-        self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
-        Ok(())
-    }
-
     fn set_block_run_used(&self, start: u64, len: u64) -> Result<()> {
         let bpg = self.sb.blocks_per_group as u64;
         let first_data = self.sb.first_data_block as u64;
@@ -3523,53 +3507,6 @@ impl Filesystem {
             }
         }
         Err(Error::NotFound)
-    }
-
-    /// Clear the inode bitmap bit for `ino`. Does NOT touch counters — the
-    /// caller pairs this with a `patch_bgd_counters` + `patch_sb_counters` call
-    /// so BGD free_inodes_count and SB free_inodes_count land together.
-    fn free_inode_slot(&self, ino: u32) -> Result<()> {
-        let ipg = self.sb.inodes_per_group;
-        let gi = ((ino - 1) / ipg) as usize;
-        if gi >= self.groups.len() {
-            return Err(Error::InvalidInode(ino));
-        }
-        let bit = ((ino - 1) % ipg) as u64;
-        let bitmap_block = self.groups[gi].inode_bitmap;
-        let bs = self.sb.block_size() as u64;
-        let mut buf = vec![0u8; bs as usize];
-        self.dev.read_at(bitmap_block * bs, &mut buf)?;
-        let byte = (bit / 8) as usize;
-        let mask = 1u8 << (bit % 8);
-        if byte < buf.len() {
-            buf[byte] &= !mask;
-        }
-        self.dev.write_at(bitmap_block * bs, &buf)?;
-
-        self.patch_bgd_counters(gi, 0, 1, 0)?;
-        Ok(())
-    }
-
-    /// Set the inode bitmap bit for `ino`. Paired with `patch_bgd_counters`
-    /// (`free_inodes_delta = -1` and, for dirs, `used_dirs_delta = +1`).
-    fn mark_inode_used(&self, ino: u32) -> Result<()> {
-        let ipg = self.sb.inodes_per_group;
-        let gi = ((ino - 1) / ipg) as usize;
-        if gi >= self.groups.len() {
-            return Err(Error::InvalidInode(ino));
-        }
-        let bit = ((ino - 1) % ipg) as u64;
-        let bitmap_block = self.groups[gi].inode_bitmap;
-        let bs = self.sb.block_size() as u64;
-        let mut buf = vec![0u8; bs as usize];
-        self.dev.read_at(bitmap_block * bs, &mut buf)?;
-        let byte = (bit / 8) as usize;
-        let mask = 1u8 << (bit % 8);
-        if byte < buf.len() {
-            buf[byte] |= mask;
-        }
-        self.dev.write_at(bitmap_block * bs, &buf)?;
-        Ok(())
     }
 
     /// Apply per-group counter deltas on disk for group `gi`. Positive deltas
@@ -4466,60 +4403,6 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Insert `name → target_ino` into `parent_inode`'s linear directory
-    /// blocks. Picks the first block with space; errors if the directory
-    /// has no room (dir-extension is a follow-up). Recomputes the block's
-    /// tail checksum when metadata_csum is on.
-    fn add_dir_entry(
-        &self,
-        parent_ino: u32,
-        parent_inode: &Inode,
-        name: &[u8],
-        target_ino: u32,
-        file_type: crate::dir::DirEntryType,
-    ) -> Result<()> {
-        let bs = self.sb.block_size();
-        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
-        let n_blocks = parent_inode.size.div_ceil(bs as u64);
-        for logical in 0..n_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
-                continue;
-            };
-            let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-                12
-            } else {
-                0
-            };
-            match crate::dir::add_entry_to_block(
-                &mut block,
-                target_ino,
-                name,
-                file_type,
-                has_ft,
-                reserved_tail,
-            ) {
-                Ok(()) => {
-                    if self.csum.enabled && reserved_tail == 12 {
-                        self.csum.patch_dir_entry_tail(
-                            parent_ino,
-                            parent_inode.generation,
-                            &mut block,
-                        );
-                    }
-                    self.dev.write_at(phys * bs as u64, &block)?;
-                    return Ok(());
-                }
-                Err(Error::OutOfBounds) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        // All existing blocks are full → grow the directory by one fs block.
-        self.extend_dir_and_add_entry(parent_ino, name, target_ino, file_type)
-    }
-
     /// Grow `parent_ino`'s directory file by one fs block, seed that block
     /// with the entry `(name → target_ino)`, and update the parent inode
     /// image (size +block_size, +1 extent, recomputed CSUM). Assumes the
@@ -4996,59 +4879,6 @@ impl Filesystem {
         // Commit data-block allocation.
         self.commit_dir_block_alloc(new_phys, &plan)?;
 
-        Ok(())
-    }
-
-    /// Remove `name` from `parent_inode`'s linear directory blocks. Errors
-    /// if the name isn't found in any block.
-    fn remove_dir_entry(&self, parent_ino: u32, parent_inode: &Inode, name: &[u8]) -> Result<()> {
-        let bs = self.sb.block_size();
-        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
-        let n_blocks = parent_inode.size.div_ceil(bs as u64);
-        for logical in 0..n_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
-                continue;
-            };
-            let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-                12
-            } else {
-                0
-            };
-            if crate::dir::remove_entry_from_block(&mut block, name, has_ft, reserved_tail)? {
-                if self.csum.enabled && reserved_tail == 12 {
-                    self.csum
-                        .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
-                }
-                self.dev.write_at(phys * bs as u64, &block)?;
-                return Ok(());
-            }
-        }
-        Err(Error::NotFound)
-    }
-
-    /// Point a directory's `..` entry at `new_parent_ino`. The `..` entry
-    /// lives in the directory's first data block, immediately after the `.`
-    /// entry at byte offset 12. Recomputes the block's tail checksum when
-    /// metadata_csum is on — the tail csum is keyed on this directory's own
-    /// ino + generation, hence both are required.
-    fn update_dotdot(&self, dir_ino: u32, dir_inode: &Inode, new_parent_ino: u32) -> Result<()> {
-        let bs = self.sb.block_size();
-        let phys = crate::extent::map_logical(&dir_inode.block, self.dev.as_ref(), bs, 0)?
-            .ok_or(Error::Corrupt("update_dotdot: dir block 0 missing"))?;
-        let mut block = self.read_block(phys)?;
-        if block.len() < 24 {
-            return Err(Error::Corrupt("update_dotdot: dir block too small"));
-        }
-        block[12..16].copy_from_slice(&new_parent_ino.to_le_bytes());
-
-        if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-            self.csum
-                .patch_dir_entry_tail(dir_ino, dir_inode.generation, &mut block);
-        }
-        self.dev.write_at(phys * bs as u64, &block)?;
         Ok(())
     }
 
