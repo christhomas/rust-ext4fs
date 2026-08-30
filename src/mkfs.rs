@@ -458,19 +458,8 @@ fn build_root_dir(block_size: u32, dir_csum_tail: usize, csum: &Checksummer) -> 
         dir_csum_tail,
     )?;
 
-    if csum.enabled {
-        let end = root_dir.len();
-        root_dir[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // inode
-        root_dir[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
-        root_dir[end - 6] = 0; // name_len
-        root_dir[end - 5] = 0xDE; // file_type marker
-        root_dir[end - 4..end].copy_from_slice(&0u32.to_le_bytes()); // csum slot
-
-        let mut c = linux_crc32c(csum.seed, &EXT4_ROOT_INO.to_le_bytes());
-        c = linux_crc32c(c, &0u32.to_le_bytes()); // generation = 0
-        c = linux_crc32c(c, &root_dir[..root_dir.len() - 12]);
-        root_dir[end - 4..end].copy_from_slice(&c.to_le_bytes());
-    }
+    // Generation 0: a freshly formatted root has never been reused.
+    csum.patch_dir_entry_tail(EXT4_ROOT_INO, 0, &mut root_dir);
     Ok(root_dir)
 }
 
