@@ -76,11 +76,49 @@ A structural fact about the crate that wants a decision, not a patch.
 
 The kind of coupling that survives until someone moves the guard.
 
-### D1, D3 — the journal tag budget rests on a premise the same function contradicts; "atomic" rename is not atomic on the overwrite path — High
+### D3 — "atomic" rename is not atomic when the destination directory has to grow — **fixed**
 
-**D3 is the one to look at soonest.** It is a correctness claim in a doc, about
-the property callers most rely on, and unlike D2 it is not merely stale — the
-overwrite path genuinely is not atomic.
+The doc promised `replace_if_exists = true` "atomically overwrites dst", and the
+body comment said the overwrite is staged "into a single buffer so a crash either
+fully replaces dst or leaves the FS in its prior state". Both are true on the
+common path and **false on one branch**: when the destination directory has no
+room for the new entry, the buffer is committed early and the un-journaled
+`extend_dir_and_add_entry` runs afterwards.
+
+On the overwrite path the early commit has already removed dst's directory entry,
+so a crash in that window leaves dst's name gone and src still present — the file
+that was at dst is unreachable and nothing has moved.
+
+The doc now names the branch, both windows, and what closing them would take:
+`extend_dir_and_add_entry` staging into the buffer rather than writing on its own,
+which is a change to the directory-growth path rather than to `apply_rename`. The
+guarantee is stated as **atomic unless the destination directory has to grow**,
+which is what the code actually does. Making it unconditionally true is a design
+decision about the journal layer, not a correction.
+
+### The second half of D3 — parent link counts read from disk mid-transaction — **fixed**
+
+Each `i_links_count` patch read its parent inode back from disk and staged a write
+of the whole record. Two patches naming the same inode in one buffer would have had
+the second read the pre-buffer bytes and overwrite the first — and the only thing
+preventing it was that the branch conditions happened to be mutually exclusive,
+which nothing stated and nothing enforced.
+
+Deltas are accumulated and applied once, `apply_parent_nlink_deltas`: every parent
+read exactly once after every delta is known, written exactly once, and a net-zero
+delta writes nothing at all. That also retires the hand-written suppression — the
+dir-replaces-dir "+1 and -1 cancel" case is now arithmetic that cancels rather than
+a branch suppressed by a condition that had to be kept in step with the branch it
+suppressed.
+
+Behaviour is unchanged; the four new tests pass against the old code too, which is
+the point — they were missing, and the invariant was one edit away from being
+false. Mutation-checked: reinstating the suppression alongside the unconditional
+delta fails `a_cross_parent_directory_replace_leaves_the_destination_parent_unchanged`.
+
+### D1 — the journal tag budget rests on a premise the same function contradicts — High
+
+Still open.
 
 ### H1, H3, M4 — `fs.rs` at 5,258 lines; `apply_pwrite` 354 and `apply_rename` 327; 341 lines indented past column 24
 

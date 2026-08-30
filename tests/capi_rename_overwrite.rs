@@ -340,3 +340,159 @@ fn replace_persists_across_remount() {
 
     fs::remove_file(&img).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Parent link counts across a rename
+//
+// A directory's `i_links_count` counts its `..` back-references: one per
+// immediate subdirectory, plus its own `.` and its entry in its parent.
+// Moving a directory between parents therefore moves one count, and
+// replacing a directory with another destroys one and creates one.
+//
+// These were uncovered. The link-count patches used to be applied where
+// each was discovered, reading the parent inode back from disk each
+// time — so two patches naming the same inode in one transaction would
+// have had the second overwrite the first. The branch that would have
+// done it was suppressed by hand, in a condition that had to be kept in
+// step with the branch it was suppressing.
+// ---------------------------------------------------------------------------
+
+fn mkdir(fs: *mut fs_ext4_fs_t, path: &str) {
+    let p = CString::new(path).unwrap();
+    let ino = unsafe { fs_ext4_mkdir(fs, p.as_ptr(), 0o755) };
+    assert!(ino > 0, "mkdir {path}: {}", last_err_str());
+}
+
+fn links(fs: *mut fs_ext4_fs_t, path: &str) -> u16 {
+    stat_attr(fs, path).link_count
+}
+
+/// Moving a directory to a different parent moves one link with it.
+#[test]
+fn a_cross_parent_directory_move_moves_one_parent_link() {
+    let img = scratch_image("xparent_dir_move");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
+
+    mkdir(fs, "/from");
+    mkdir(fs, "/to");
+    mkdir(fs, "/from/sub");
+
+    let from_before = links(fs, "/from");
+    let to_before = links(fs, "/to");
+
+    let rc = rename2(fs, "/from/sub", "/to/sub", 0);
+    assert_eq!(rc, 0, "rename2: {}", last_err_str());
+
+    assert_eq!(
+        links(fs, "/from"),
+        from_before - 1,
+        "the old parent lost a subdirectory"
+    );
+    assert_eq!(links(fs, "/to"), to_before + 1, "the new parent gained one");
+    assert!(path_exists(fs, "/to/sub"));
+
+    unsafe { fs_ext4_umount(fs) };
+    fs::remove_file(&img).ok();
+}
+
+/// Replacing a directory within one parent loses exactly one link.
+#[test]
+fn a_same_parent_directory_replace_loses_one_parent_link() {
+    let img = scratch_image("same_parent_dir_replace");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
+
+    mkdir(fs, "/holder");
+    mkdir(fs, "/holder/a");
+    mkdir(fs, "/holder/b");
+
+    let before = links(fs, "/holder");
+
+    let rc = rename2(fs, "/holder/a", "/holder/b", FS_EXT4_RENAME_REPLACE);
+    assert_eq!(rc, 0, "rename2 replace: {}", last_err_str());
+
+    assert_eq!(
+        links(fs, "/holder"),
+        before - 1,
+        "two subdirectories became one"
+    );
+    assert!(!path_exists(fs, "/holder/a"));
+    assert!(path_exists(fs, "/holder/b"));
+
+    unsafe { fs_ext4_umount(fs) };
+    fs::remove_file(&img).ok();
+}
+
+/// The case where two deltas name the same inode.
+///
+/// A directory moves from one parent into another, replacing a
+/// directory there: the destination parent gains the arriving
+/// subdirectory (+1) and loses the departing one (-1). They must cancel
+/// — and they are discovered in two different branches, hundreds of
+/// lines apart, which is what made a hand-suppressed `+1` fragile.
+#[test]
+fn a_cross_parent_directory_replace_leaves_the_destination_parent_unchanged() {
+    let img = scratch_image("xparent_dir_replace");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
+
+    mkdir(fs, "/left");
+    mkdir(fs, "/right");
+    mkdir(fs, "/left/moving");
+    mkdir(fs, "/right/doomed");
+
+    let left_before = links(fs, "/left");
+    let right_before = links(fs, "/right");
+
+    let rc = rename2(fs, "/left/moving", "/right/doomed", FS_EXT4_RENAME_REPLACE);
+    assert_eq!(rc, 0, "rename2 replace: {}", last_err_str());
+
+    assert_eq!(
+        links(fs, "/left"),
+        left_before - 1,
+        "the source parent lost its subdirectory"
+    );
+    assert_eq!(
+        links(fs, "/right"),
+        right_before,
+        "the destination parent gained one and lost one — net zero"
+    );
+    assert!(path_exists(fs, "/right/doomed"));
+    assert!(!path_exists(fs, "/left/moving"));
+
+    unsafe { fs_ext4_umount(fs) };
+    fs::remove_file(&img).ok();
+}
+
+/// The counts must survive the journal, not just the in-memory view.
+#[test]
+fn parent_link_counts_survive_a_remount() {
+    let img = scratch_image("nlink_remount");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+
+    {
+        let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+        assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
+        mkdir(fs, "/src");
+        mkdir(fs, "/dst");
+        mkdir(fs, "/src/kid");
+        let rc = rename2(fs, "/src/kid", "/dst/kid", 0);
+        assert_eq!(rc, 0, "rename2: {}", last_err_str());
+        unsafe { fs_ext4_umount(fs) };
+    }
+
+    {
+        let fs = unsafe { fs_ext4_mount(img_c.as_ptr()) };
+        assert!(!fs.is_null(), "ro remount: {}", last_err_str());
+        // 2 for `.` and the entry in `/`, plus one per subdirectory.
+        assert_eq!(links(fs, "/src"), 2, "/src has no subdirectories left");
+        assert_eq!(links(fs, "/dst"), 3, "/dst has one");
+        unsafe { fs_ext4_umount(fs) };
+    }
+
+    fs::remove_file(&img).ok();
+}
