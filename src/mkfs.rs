@@ -33,6 +33,13 @@ const ROOT_MODE: u16 = 0o40755; // S_IFDIR | 0755
 const EXTENT_MAGIC: u16 = 0xF30A;
 
 /// Smallest filesystem block size this formatter will lay out.
+/// The block size `mkfs` uses when the caller does not choose one.
+///
+/// Named because it was written out at three sites — the CLI's default,
+/// its help text, and the library — which is three places to change and
+/// two chances to forget.
+pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
+
 pub const MIN_BLOCK_SIZE: u32 = 1024;
 /// Largest filesystem block size this formatter will lay out.
 pub const MAX_BLOCK_SIZE: u32 = 65536;
@@ -856,9 +863,15 @@ fn build_superblock(
     // s_journal_inum at 0xE0..0xE4 — set to inode 8 for ext3 (HAS_JOURNAL),
     // zero for everything else. (The 0xD8 region holds algorithm bits +
     // prealloc counters, NOT the journal inode pointer.)
+    // 0xE0..0xE4 is s_journal_inum, which the line below writes. The two
+    // comments that used to sit here named it 0xDC (s_journal_dev) and
+    // then claimed 0xE0 was s_last_orphan — contradicting the write
+    // immediately above them and this crate's own reader, which parses
+    // the journal inode from 0xE0 and documents s_last_orphan at 0xE8.
+    //
+    // s_journal_dev (0xDC) and s_last_orphan (0xE8) are both left zero;
+    // neither is written here.
     sb[0xE0..0xE4].copy_from_slice(&journal_inum.to_le_bytes());
-    // 0xDC..0xE0 s_journal_dev  — 0.
-    // 0xE0..0xE4 s_last_orphan  — 0.
     // 0xE4..0xF4 s_hash_seed[4] — pick a stable nonzero seed. (Only matters
     // if HTree is in play; we don't set DIR_INDEX, but ext4 formatter still seeds
     // these so tools don't whine.)

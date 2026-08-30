@@ -637,10 +637,14 @@ impl Filesystem {
     /// (extent-tree updates + freed-block ranges) with actual disk writes —
     /// rewrites the inode and zeros the freed bitmap bits.
     ///
-    /// Not journaled. Safe to call only in a context where crash consistency
-    /// is handled elsewhere (e.g. a test scratch image). A future revision
-    /// will route this through a JBD2 transaction so the inode write + bitmap
-    /// writes are atomic with respect to a crash.
+    /// Journaled. The inode write, the bitmap writes, the BGD and the
+    /// superblock accumulate into one `BlockBuffer` and commit as a
+    /// single transaction, so they are atomic with respect to a crash.
+    ///
+    /// This said "Not journaled … safe only in a test scratch image", and
+    /// promised the transaction as future work. The future work landed;
+    /// the warning outlived it and was steering callers away from an API
+    /// that is safe.
     pub fn apply_truncate_shrink(&self, ino: u32, new_size: u64) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
@@ -2791,7 +2795,12 @@ impl Filesystem {
     /// This is the "Finder just saved a document" path — complete rewrite of
     /// a file. Piecewise writes / appends / sparse writes come later.
     ///
-    /// Not journaled — scratch-image safe, same caveat as other Phase-4 ops.
+    /// Journaled, and atomic across the whole replace: freeing the old
+    /// data, allocating the new run, the bitmap, BGD and superblock
+    /// updates, the new block contents and the inode all commit as one
+    /// transaction — as the comment twenty-eight lines into the body
+    /// already said.
+    ///
     /// Returns the new file size on success.
     pub fn apply_replace_file_content(&self, path: &str, data: &[u8]) -> Result<u64> {
         if !self.dev.is_writable() {

@@ -128,7 +128,7 @@ fn run() -> Result<(), String> {
         .as_deref()
         .ok_or_else(|| format!("missing positional <device> argument\n\n{USAGE}"))?;
 
-    let block_size = opts.block_size.unwrap_or(4096);
+    let block_size = opts.block_size.unwrap_or(fs_ext4::mkfs::DEFAULT_BLOCK_SIZE);
 
     // --create-size handling. Three cases per the doc'd contract:
     //   (a) device path already exists as a regular file: leave it
