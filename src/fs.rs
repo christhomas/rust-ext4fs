@@ -4099,7 +4099,8 @@ impl Filesystem {
     /// - Same source and dest: no-op success.
     /// - When dst already exists:
     ///     - `replace_if_exists = false` → returns `Error::AlreadyExists`.
-    ///     - `replace_if_exists = true` → atomically overwrites dst.
+    ///     - `replace_if_exists = true` → overwrites dst. See
+    ///       "Atomicity" below for exactly how far that holds.
     ///       Type-compatibility rules (POSIX rename(2)):
     ///         * file→dir   → `Error::IsADirectory`
     ///         * dir→file   → `Error::NotADirectory`
@@ -4109,6 +4110,33 @@ impl Filesystem {
     ///       Otherwise the previous dst inode's link count is decremented
     ///       in the same buffer; if that drops it to zero the inode's
     ///       extents and slot are freed in the same atomic commit.
+    ///
+    /// # Atomicity, and the one place it does not hold
+    ///
+    /// Both paths stage their work into a single [`BlockBuffer`] and
+    /// commit it through the journal, so a crash either applies the
+    /// whole rename or none of it.
+    ///
+    /// **Except when the destination directory has no room for the new
+    /// entry.** Then the buffer is committed early and
+    /// `extend_dir_and_add_entry` — which is not journaled — runs
+    /// afterwards. That splits the operation in two, and the window
+    /// between them is a real one:
+    ///
+    /// - On the overwrite path, the early commit has already removed
+    ///   dst's directory entry. A crash there leaves dst's name gone
+    ///   and src still present: the file that was at dst is
+    ///   unreachable, and src has not moved.
+    /// - On the no-overwrite path, the early commit is empty, so a
+    ///   crash in the extend leaves the filesystem as it was — but a
+    ///   crash *after* it leaves both names pointing at src's inode
+    ///   with a link count of one.
+    ///
+    /// Closing this needs `extend_dir_and_add_entry` to stage into the
+    /// buffer rather than write on its own, which is a change to the
+    /// directory-growth path rather than to this function. Until then
+    /// the guarantee is: **atomic unless the destination directory has
+    /// to grow.**
     pub fn apply_rename(&self, src: &str, dst: &str, replace_if_exists: bool) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
@@ -4216,8 +4244,31 @@ impl Filesystem {
 
             // Stage the whole overwrite into a single buffer so a crash
             // either fully replaces dst or leaves the FS in its prior
-            // state.
+            // state — UNLESS the destination directory has to grow, in
+            // which case this buffer is committed early and the
+            // un-journaled extend runs after it. See the "Atomicity"
+            // section on this function for what that window costs.
             let mut buf = BlockBuffer::new(self.sb.block_size());
+
+            // Parent link-count changes are ACCUMULATED rather than
+            // applied where they are discovered.
+            //
+            // Each site used to read its parent inode back from disk and
+            // stage a write of it. Two such sites naming the same inode
+            // in one buffer would have the second read stale bytes and
+            // overwrite the first's change — and the only thing
+            // preventing that was that their branch conditions happened
+            // to be mutually exclusive, which nothing said and nothing
+            // enforced.
+            //
+            // Summing deltas and applying them once removes the hazard
+            // instead of relying on it not being reached: every parent
+            // is read exactly once, after every delta is known, and
+            // written exactly once. It also turns the dir-replaces-dir
+            // "these two cancel out" reasoning into arithmetic that
+            // cancels, rather than a suppressed branch that has to be
+            // kept in step with the branch it suppresses.
+            let mut parent_nlink: BTreeMap<u32, i32> = BTreeMap::new();
 
             // 1. Pop the existing dst entry from dst_parent so the
             //    in-place add below has somewhere to land.
@@ -4266,26 +4317,12 @@ impl Filesystem {
 
             // 4. Cross-parent dir move: fix `..` + parent nlinks.
             //    For dir-replaces-dir the dst_parent gains the moved
-            //    subdir but loses the dropped subdir → net zero. The
-            //    -1 for the dropped subdir is applied below in the reap
-            //    branch; suppress the +1 here when we'd otherwise apply
-            //    both.
+            //    subdir and loses the dropped one; both deltas are
+            //    recorded and cancel in the sum.
             if src_is_dir && src_parent_ino != dst_parent_ino {
                 self.buffer_update_dotdot(&mut buf, src_ino, &src_inode, dst_parent_ino)?;
-
-                // Source parent loses one subdir → -1 nlink.
-                let (sp_inode, mut sp_raw) = self.read_inode_verified(src_parent_ino)?;
-                self.patch_inode_nlink(src_parent_ino, &mut sp_raw, &sp_inode, -1)?;
-                self.buffer_write_inode(&mut buf, src_parent_ino, &sp_raw)?;
-
-                // Dest parent: only bump if NOT replacing a dir (which
-                // would offset the bump). With dir-replaces-dir the
-                // dropped subdir's -1 happens below, balancing the +1.
-                if !dst_is_dir {
-                    let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
-                    self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, 1)?;
-                    self.buffer_write_inode(&mut buf, dst_parent_ino, &dp_raw)?;
-                }
+                *parent_nlink.entry(src_parent_ino).or_default() -= 1;
+                *parent_nlink.entry(dst_parent_ino).or_default() += 1;
             }
 
             // 5. Decrement dst_old_ino's link count. If it hits zero,
@@ -4362,16 +4399,15 @@ impl Filesystem {
                 self.buffer_write_inode(&mut buf, dst_old_ino, &dst_old_raw)?;
 
                 // Dir-replaces-dir: dst_parent loses the removed subdir's
-                // `..` reference → -1 nlink. Skipped for the cross-parent
-                // dir move (the +1 above was already suppressed, so the
-                // two deltas cancel without further work).
-                if dst_is_dir && !(src_is_dir && src_parent_ino != dst_parent_ino) {
-                    let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
-                    self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, -1)?;
-                    self.buffer_write_inode(&mut buf, dst_parent_ino, &dp_raw)?;
+                // `..` reference → -1 nlink. Recorded unconditionally;
+                // when a cross-parent dir move already recorded a +1 for
+                // the same parent, the sum is what cancels them.
+                if dst_is_dir {
+                    *parent_nlink.entry(dst_parent_ino).or_default() -= 1;
                 }
             }
 
+            self.apply_parent_nlink_deltas(&mut buf, &parent_nlink)?;
             return self.commit_block_buffer(buf);
         }
 
@@ -4380,8 +4416,12 @@ impl Filesystem {
         // ===================================================================
         // Multi-block transaction: insert dst entry + remove src entry +
         // (cross-parent dir) update .. + adjust parent nlinks. Atomic so
-        // a crash either fully renames or leaves the original.
+        // a crash either fully renames or leaves the original — UNLESS
+        // the destination directory has to grow, which commits this
+        // buffer early and then runs the un-journaled extend. See the
+        // "Atomicity" section on this function.
         let mut buf = BlockBuffer::new(self.sb.block_size());
+        let mut parent_nlink: BTreeMap<u32, i32> = BTreeMap::new();
 
         let dst_extends = match self.buffer_add_dir_entry_inplace(
             &mut buf,
@@ -4416,20 +4456,44 @@ impl Filesystem {
 
         if src_is_dir && src_parent_ino != dst_parent_ino {
             self.buffer_update_dotdot(&mut buf, src_ino, &src_inode, dst_parent_ino)?;
-
-            // Source parent loses one subdir → -1 nlink.
-            let (sp_inode, mut sp_raw) = self.read_inode_verified(src_parent_ino)?;
-            self.patch_inode_nlink(src_parent_ino, &mut sp_raw, &sp_inode, -1)?;
-            self.buffer_write_inode(&mut buf, src_parent_ino, &sp_raw)?;
-
-            // Dest parent gains one → +1. Re-read in case extend
-            // rewrote it above.
-            let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
-            self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, 1)?;
-            self.buffer_write_inode(&mut buf, dst_parent_ino, &dp_raw)?;
+            *parent_nlink.entry(src_parent_ino).or_default() -= 1;
+            *parent_nlink.entry(dst_parent_ino).or_default() += 1;
         }
 
+        // Read after the extend above, if there was one, so the counts
+        // come from what is actually on disk now.
+        self.apply_parent_nlink_deltas(&mut buf, &parent_nlink)?;
         self.commit_block_buffer(buf)
+    }
+
+    /// Apply accumulated `i_links_count` deltas, one read and one write
+    /// per inode.
+    ///
+    /// The point is the "one read" half. Patching a link count means
+    /// reading the inode, changing the field and staging the whole
+    /// record — so two patches of the same inode staged into one buffer
+    /// would have the second read the *pre-buffer* bytes from disk and
+    /// write them back over the first. Summing first makes that
+    /// impossible rather than merely unreached.
+    ///
+    /// A delta of zero writes nothing. That is what makes the
+    /// dir-replaces-dir case (+1 for the arriving subdirectory, -1 for
+    /// the departing one) come out as no write at all, without a branch
+    /// anywhere having to know about the other.
+    fn apply_parent_nlink_deltas(
+        &self,
+        buf: &mut BlockBuffer,
+        deltas: &BTreeMap<u32, i32>,
+    ) -> Result<()> {
+        for (&ino, &delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let (inode, mut raw) = self.read_inode_verified(ino)?;
+            self.patch_inode_nlink(ino, &mut raw, &inode, delta)?;
+            self.buffer_write_inode(buf, ino, &raw)?;
+        }
+        Ok(())
     }
 
     /// Insert `name → target_ino` into `parent_inode`'s linear directory
