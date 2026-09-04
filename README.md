@@ -301,6 +301,15 @@ Highlights from the last 50 commits, grouped by date.
 - A truncated inode read now fails closed. The checksum verifier had
   accepted a short read as a pass; a read that did not return the bytes
   is not a checksum that matched.
+- Four format-conformance fixes: a bigalloc filesystem is refused rather
+  than misread (its cluster arithmetic is not implemented, so every
+  block-group offset would be wrong); timestamps apply the epoch-extension
+  bits and are read as signed, so dates past 2038 and before 1970 are no
+  longer 136 years out; a missing inline-data spill xattr is corruption
+  rather than a silently truncated file; and a *writable* mount of an MMP
+  filesystem is refused, read-only being unaffected.
+- **The C attribute struct's timestamps widen to `int64_t`, moving every
+  field after them.** Consumers must recompile, not relink.
 - Dependencies move to `am-fs-core` 0.2.4.
 
 ### 2026-08-29 — 0.4.1 — the multi-group formatter in front of e2fsck

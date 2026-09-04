@@ -88,9 +88,7 @@ pub const SUPPORTED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
     | RoCompat::QUOTA.bits()
     | RoCompat::METADATA_CSUM.bits()
     | RoCompat::PROJECT.bits()
-    | RoCompat::ORPHAN_PRESENT.bits()
-    | RoCompat::BIGALLOC.bits()  // tolerated; cluster math may need updates
-    ;
+    | RoCompat::ORPHAN_PRESENT.bits();
 
 /// Filesystem dialect — derived from the on-disk feature flags at mount time.
 /// Drives runtime behaviour where ext2 / ext3 / ext4 differ:
@@ -155,16 +153,121 @@ impl FsFlavor {
     }
 }
 
+/// RO_COMPAT bits that change how the filesystem is *read*, and so
+/// cannot be ignored even by a read-only mount.
+///
+/// The compatibility model says an unknown RO_COMPAT bit is safe to
+/// mount read-only, and for almost every bit that is true: they
+/// describe things a reader may ignore (quota accounting, project
+/// IDs, the orphan list). This crate relied on that blanket rule.
+///
+/// **BIGALLOC is the exception, and it is not a small one.** It
+/// changes the allocation unit from the block to the *cluster*:
+/// `s_log_cluster_size` exceeds `s_log_block_size`, the block bitmaps
+/// track clusters, and `s_clusters_per_group` replaces
+/// `s_blocks_per_group` as the group stride. A reader that assumes
+/// cluster == block computes every block-group offset wrong and
+/// returns whatever happens to live there — silently, because nothing
+/// about the read fails.
+///
+/// The rule "unknown RO_COMPAT is safe read-only" holds for a reader
+/// that *understands* the bit and merely chooses not to act on it. It
+/// does not hold for one that has never heard of it and whose
+/// arithmetic it invalidates. Until the cluster arithmetic exists,
+/// refusing is the honest answer.
+pub const READ_BREAKING_RO_COMPAT: u32 = RoCompat::BIGALLOC.bits();
+
 /// Check whether the filesystem can be mounted read-only.
 /// Returns Err with the unsupported bits if not.
-pub fn check_mountable(feature_incompat: u32, _feature_ro_compat: u32) -> crate::error::Result<()> {
+pub fn check_mountable(feature_incompat: u32, feature_ro_compat: u32) -> crate::error::Result<()> {
     let unsupported_incompat = feature_incompat & !SUPPORTED_INCOMPAT;
     if unsupported_incompat != 0 {
         return Err(crate::error::Error::UnsupportedIncompat(
             unsupported_incompat,
         ));
     }
-    // RO_COMPAT bits are all OK for read-only mount even if unknown,
-    // per the spec's compatibility model. We log them but don't fail.
+    // Most RO_COMPAT bits are safe to ignore on a read-only mount, per
+    // the compatibility model. The exceptions are the ones that change
+    // how bytes are located — see READ_BREAKING_RO_COMPAT.
+    let breaking = feature_ro_compat & READ_BREAKING_RO_COMPAT;
+    if breaking != 0 {
+        return Err(crate::error::Error::UnsupportedRoCompat(breaking));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod mountability_tests {
+    use super::*;
+
+    /// A bigalloc filesystem is refused rather than misread.
+    ///
+    /// This is the case the blanket "unknown RO_COMPAT is safe
+    /// read-only" rule got wrong. With bigalloc the allocation unit is
+    /// the cluster, so a reader assuming cluster == block computes
+    /// every block-group offset wrong and returns whatever lives
+    /// there. Refusing is not a limitation being admitted; it is the
+    /// difference between an error and silent corruption.
+    #[test]
+    fn a_bigalloc_filesystem_is_refused() {
+        let err = check_mountable(0, RoCompat::BIGALLOC.bits())
+            .expect_err("bigalloc changes the allocation unit and must not be mounted blind");
+        match err {
+            crate::error::Error::UnsupportedRoCompat(bits) => {
+                assert_eq!(bits, RoCompat::BIGALLOC.bits());
+            }
+            other => panic!("expected UnsupportedRoCompat, got {other:?}"),
+        }
+    }
+
+    /// Every other RO_COMPAT bit still mounts. The point is a targeted
+    /// refusal, not a stricter filesystem.
+    /// Every tolerated RO_COMPAT bit mounts.
+    ///
+    /// Derived from `SUPPORTED_RO_COMPAT` rather than hand-listed. A
+    /// hand-written list is a second place to remember a bit, and the
+    /// one it forgot was GDT_CSUM: supported since the first release,
+    /// never asserted, so a regression rejecting it would have passed
+    /// this suite.
+    #[test]
+    fn the_other_ro_compat_bits_still_mount() {
+        let tolerated = SUPPORTED_RO_COMPAT & !READ_BREAKING_RO_COMPAT;
+        assert_ne!(tolerated, 0, "nothing to check — the masks are wrong");
+        for shift in 0..32 {
+            let bit = 1u32 << shift;
+            if tolerated & bit == 0 {
+                continue;
+            }
+            check_mountable(0, bit)
+                .unwrap_or_else(|e| panic!("ro_compat {bit:#x} should mount read-only, got {e:?}"));
+        }
+    }
+
+    /// An RO_COMPAT bit this crate has never heard of still mounts.
+    ///
+    /// That is the compatibility model working as intended, and the
+    /// reason the refusal above has to be an explicit list rather than
+    /// "anything outside SUPPORTED_RO_COMPAT".
+    #[test]
+    fn an_unknown_ro_compat_bit_still_mounts() {
+        check_mountable(0, 0x8000_0000).expect("unknown RO_COMPAT is safe on a read-only mount");
+    }
+
+    /// The two masks must not contradict each other: a bit cannot be
+    /// both supported and read-breaking.
+    #[test]
+    fn the_supported_and_breaking_masks_are_disjoint() {
+        assert_eq!(
+            SUPPORTED_RO_COMPAT & READ_BREAKING_RO_COMPAT,
+            0,
+            "a bit cannot be both tolerated and refused"
+        );
+    }
+
+    /// An unsupported INCOMPAT bit is still refused — the existing
+    /// behaviour, pinned so the RO_COMPAT change did not disturb it.
+    #[test]
+    fn an_unsupported_incompat_bit_is_still_refused() {
+        assert!(check_mountable(0x8000_0000, 0).is_err());
+    }
 }

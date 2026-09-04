@@ -165,10 +165,17 @@ pub struct fs_ext4_attr_t {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
-    pub atime: u32,
-    pub mtime: u32,
-    pub ctime: u32,
-    pub crtime: u32,
+    /// Seconds since the Unix epoch, signed and 64-bit.
+    ///
+    /// Widened from `u32` in 0.6.0. ext4's on-disk base field is a
+    /// SIGNED 32-bit value which the matching `*_extra` field extends
+    /// by two further bits, so the real range is roughly 1901..2446.
+    /// A `u32` here truncated everything past 2038 and turned every
+    /// pre-1970 date into a far-future one.
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub crtime: i64,
     pub link_count: u16,
     pub file_type: fs_ext4_file_type_t,
     /// Sub-second nanoseconds for atime/mtime/ctime/crtime (0 for old inodes).
@@ -2168,19 +2175,28 @@ pub unsafe extern "C" fn fs_ext4_set_flags(
 }
 
 /// Set the access + modification times on `path`. Each `*_sec` is the
-/// POSIX seconds-since-epoch; pass `u32::MAX` (0xFFFF_FFFF) to leave a
-/// given pair unchanged. `*_nsec` are the sub-second nanoseconds (written
-/// only when i_extra_isize covers them). Bumps i_ctime.
+/// POSIX seconds-since-epoch, signed and 64-bit to match what the format
+/// stores; pass `FS_EXT4_TIME_OMIT` (`INT64_MIN`) to leave a given pair
+/// unchanged. `*_nsec` are the sub-second nanoseconds (written only when
+/// i_extra_isize covers them). Bumps i_ctime.
+///
+/// Widened from `uint32_t` in 0.5.0. The old type could not express a
+/// pre-1970 date, and its `UINT32_MAX` sentinel collided with a real
+/// date in 2106; more to the point, a caller passing a post-2038 value
+/// got it stored without the epoch-extension bits and read it back 136
+/// years early.
 ///
 /// Returns 0 on success, -1 on failure with details in
-/// `fs_ext4_last_error`.
+/// `fs_ext4_last_error`. Fails with EINVAL for a time outside the range
+/// ext4 can store, or one needing the epoch bits on an inode too small
+/// to carry an `*_extra` field.
 #[no_mangle]
 pub unsafe extern "C" fn fs_ext4_utimens(
     fs: *mut fs_ext4_fs_t,
     path: *const c_char,
-    atime_sec: u32,
+    atime_sec: i64,
     atime_nsec: u32,
-    mtime_sec: u32,
+    mtime_sec: i64,
     mtime_nsec: u32,
 ) -> c_int {
     ffi_guard(

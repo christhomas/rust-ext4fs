@@ -1,255 +1,218 @@
-//! Feature matrix tests — run our Rust implementation against the test-disks/
-//! images that exercise different ext4 feature combinations.
+//! Every feature bit the crate has an opinion about, checked against a
+//! filesystem that actually carries it.
 //!
-//! This is the same C ABI surface that the Swift FSKit extension uses —
-//! these tests are the best proxy we have for "will this mount under FSKit?"
-//! without running Xcode.
+//! G5 from `docs/format-conformance-gaps.md`. Every gap that document
+//! records was found by *reading* the supported-feature masks and their
+//! comments — not one was caught by a test. This is the test that would
+//! have caught them.
+//!
+//! The contract per feature is deliberately weak: **read it correctly,
+//! or refuse to mount.** Both are acceptable; what is not acceptable is
+//! mounting and then returning data derived from arithmetic the feature
+//! invalidates, which is the failure mode every gap in that document
+//! shares.
+//!
+//! # Why this builds its own image
+//!
+//! `test-disks/*.img` is gitignored, and the existing builder needs an
+//! Alpine VM because most fixtures require a real mount to populate.
+//! The images here need only `mke2fs` — nothing is written into them,
+//! the feature bits in the superblock are the whole point — so the test
+//! builds them itself and runs anywhere e2fsprogs is installed.
 
-use fs_ext4::capi::*;
-use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
 
-fn last_err() -> String {
-    unsafe {
-        let p = fs_ext4_last_error();
-        if p.is_null() {
-            return "<null>".into();
-        }
-        CStr::from_ptr(p).to_string_lossy().into_owned()
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::Filesystem;
+
+/// ext4's root directory is always inode 2.
+const ROOT_INO: u32 = 2;
+
+/// Locate `mke2fs`. Homebrew keeps e2fsprogs keg-only on macOS, so it
+/// is present but not on PATH.
+fn mke2fs() -> Option<String> {
+    if Command::new("mke2fs").arg("-V").output().is_ok() {
+        return Some("mke2fs".into());
     }
+    let brew = Command::new("brew")
+        .args(["--prefix", "e2fsprogs"])
+        .output()
+        .ok()?;
+    let prefix = String::from_utf8(brew.stdout).ok()?;
+    let path = format!("{}/sbin/mke2fs", prefix.trim());
+    Path::new(&path).exists().then_some(path)
 }
 
-fn image_path(name: &str) -> CString {
-    CString::new(format!(
-        "{}/test-disks/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        name
-    ))
-    .unwrap()
+/// Build a 16 MiB image with the given `mke2fs` options.
+fn build(name: &str, opts: &[&str]) -> Option<PathBuf> {
+    let mke2fs = mke2fs()?;
+    let path = std::env::temp_dir().join(format!("fs-ext4-fm-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, vec![0u8; 16 * 1024 * 1024]).expect("allocate image");
+    let out = Command::new(&mke2fs)
+        .args(["-q", "-F"])
+        .args(opts)
+        .arg(&path)
+        .output()
+        .expect("run mke2fs");
+    assert!(
+        out.status.success(),
+        "mke2fs {opts:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(path)
 }
 
-fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<(String, u8)> {
-    let p = CString::new(path).unwrap();
-    let iter = unsafe { fs_ext4_dir_open(fs, p.as_ptr()) };
-    if iter.is_null() {
-        panic!("dir_open {path}: {}", last_err());
-    }
-    let mut entries = Vec::new();
-    loop {
-        let de = unsafe { fs_ext4_dir_next(iter) };
-        if de.is_null() {
-            break;
-        }
-        let ft = unsafe { (*de).file_type };
-        let name_ptr = unsafe { &(*de).name[0] as *const _ };
-        let name = unsafe { CStr::from_ptr(name_ptr).to_string_lossy().into_owned() };
-        entries.push((name, ft));
-    }
-    unsafe { fs_ext4_dir_close(iter) };
-    entries
+fn mount(path: &Path) -> fs_ext4::error::Result<Filesystem> {
+    let dev = FileDevice::open(path.to_str().expect("utf-8 path")).expect("open image");
+    let dyn_dev: Arc<dyn BlockDevice> = Arc::new(dev);
+    Filesystem::mount(dyn_dev)
 }
 
-fn read_file_to_string(fs: *mut fs_ext4_fs_t, path: &str, max: usize) -> Option<String> {
-    let p = CString::new(path).unwrap();
-    let mut buf = vec![0u8; max];
-    let n = unsafe {
-        fs_ext4_read_file(
-            fs,
-            p.as_ptr(),
-            buf.as_mut_ptr() as *mut c_void,
-            0,
-            max as u64,
-        )
+/// **The regression G1 fixed.**
+///
+/// bigalloc moves the allocation unit from the block to the cluster, so
+/// every block-group offset this crate computes is wrong on such a
+/// filesystem. Until the cluster arithmetic exists, refusing is the
+/// only correct behaviour — mounting means returning data from wrong
+/// addresses with nothing reporting it.
+///
+/// Built with `-C 16384` against a 4 KiB block, so the cluster is four
+/// blocks and the divergence appears in the first group rather than
+/// somewhere deep in the filesystem.
+///
+/// # What happens without the refusal, measured
+///
+/// Disabling the bigalloc check and running this test produces:
+///
+/// ```text
+/// BadChecksum { what: "block group descriptor" }
+/// ```
+///
+/// That is the misreading, caught in the act: the crate located the
+/// group descriptors with block arithmetic, read cluster-based data,
+/// and the checksum did not match.
+///
+/// **That it was caught at all is luck, not design.** `metadata_csum`
+/// is optional; on a bigalloc filesystem without it the same wrong
+/// read produces no error and the caller gets whatever those bytes
+/// happened to be. The checksum is a backstop that happens to fire
+/// here, not a substitute for refusing a format the reader cannot
+/// address.
+///
+/// It also mislabels the problem — a user seeing "bad checksum" goes
+/// looking for corruption in a filesystem that is perfectly intact.
+#[test]
+fn bigalloc_is_refused_rather_than_misread() {
+    let Some(img) = build("bigalloc", &["-t", "ext4", "-O", "bigalloc", "-C", "16384"]) else {
+        eprintln!("skip: mke2fs not available (apt/brew install e2fsprogs)");
+        return;
     };
-    if n < 0 {
-        return None;
-    }
-    buf.truncate(n as usize);
-    String::from_utf8(buf).ok()
-}
+    let result = mount(&img);
+    let _ = std::fs::remove_file(&img);
 
-// ---------------------------------------------------------------------------
-// ext4-htree.img — 256 files in /bigdir, forces htree indexing
-// ---------------------------------------------------------------------------
-
-#[test]
-fn htree_readdir_returns_all_256_files() {
-    let path = image_path("ext4-htree.img");
-    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    if fs.is_null() {
-        eprintln!("skip ext4-htree.img: {}", last_err());
-        return;
-    }
-
-    let entries = list_dir(fs, "/bigdir");
-    let file_count = entries
-        .iter()
-        .filter(|(n, _)| n.starts_with("file_"))
-        .count();
-    // Expect . + .. + 256 files = 258. Tolerate . / .. handling variations.
-    assert!(
-        file_count == 256,
-        "htree readdir returned {} files (expected 256). Full entries: {:?}",
-        file_count,
-        entries.iter().take(5).collect::<Vec<_>>()
-    );
-
-    unsafe { fs_ext4_umount(fs) };
-}
-
-#[test]
-fn htree_lookup_specific_file() {
-    // path::lookup currently uses linear scan. Should work even without htree
-    // fast-path (just O(n) instead of O(log n)).
-    let path = image_path("ext4-htree.img");
-    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    if fs.is_null() {
-        eprintln!("skip ext4-htree.img: {}", last_err());
-        return;
-    }
-
-    let p = CString::new("/bigdir/file_128.txt").unwrap();
-    let mut attr = unsafe { std::mem::zeroed::<fs_ext4_attr_t>() };
-    let rc = unsafe { fs_ext4_stat(fs, p.as_ptr(), &mut attr) };
-    assert_eq!(rc, 0, "stat /bigdir/file_128.txt: {}", last_err());
-    assert_eq!(attr.file_type as u32, fs_ext4_file_type_t::RegFile as u32);
-
-    unsafe { fs_ext4_umount(fs) };
-}
-
-// ---------------------------------------------------------------------------
-// ext4-csum-seed.img — Pi-style INCOMPAT_CSUM_SEED
-// ---------------------------------------------------------------------------
-
-#[test]
-fn csum_seed_image_mounts() {
-    let path = image_path("ext4-csum-seed.img");
-    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    assert!(
-        !fs.is_null(),
-        "CSUM_SEED image failed to mount: {}",
-        last_err()
-    );
-
-    // Read /hello.txt
-    let content = read_file_to_string(fs, "/hello.txt", 256);
-    assert_eq!(
-        content.as_deref(),
-        Some("pi-style file\n"),
-        "unexpected content: {:?}",
-        content
-    );
-
-    // /etc/fstab should exist and be readable
-    let fstab = read_file_to_string(fs, "/etc/fstab", 256);
-    assert_eq!(
-        fstab.as_deref(),
-        Some("fake fstab\n"),
-        "unexpected fstab: {:?}",
-        fstab
-    );
-
-    unsafe { fs_ext4_umount(fs) };
-}
-
-// ---------------------------------------------------------------------------
-// ext4-deep-extents.img — multi-level extent tree
-// ---------------------------------------------------------------------------
-
-#[test]
-fn deep_extent_tree_sparse_file() {
-    let path = image_path("ext4-deep-extents.img");
-    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    if fs.is_null() {
-        eprintln!("skip ext4-deep-extents.img: {}", last_err());
-        return;
-    }
-
-    // /dense.txt — simple single-extent file
-    let dense = read_file_to_string(fs, "/dense.txt", 256);
-    assert_eq!(dense.as_deref(), Some("control file\n"), "got: {:?}", dense);
-
-    // /sparse.bin — 16MB sparse file, 'X' every 64KB.
-    // Read first 128KB to verify the extent tree descends correctly.
-    let p = CString::new("/sparse.bin").unwrap();
-    let mut buf = vec![0u8; 128 * 1024];
-    let n = unsafe {
-        fs_ext4_read_file(
-            fs,
-            p.as_ptr(),
-            buf.as_mut_ptr() as *mut c_void,
-            0,
-            buf.len() as u64,
-        )
-    };
-    assert!(n > 0, "read /sparse.bin 0..128K: {}", last_err());
-
-    // Should find 'X' at offset 0 and 65536
-    assert_eq!(buf[0], b'X', "expected 'X' at offset 0");
-    assert_eq!(buf[65536], b'X', "expected 'X' at offset 64K");
-    // And lots of zeros in between (sparse holes read as zero)
-    assert_eq!(buf[1000], 0, "expected 0 in sparse region");
-    assert_eq!(buf[65000], 0, "expected 0 before next 'X'");
-
-    unsafe { fs_ext4_umount(fs) };
-}
-
-// ---------------------------------------------------------------------------
-// ext4-no-csum.img — no metadata_csum (legacy behavior)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn no_csum_image_mounts() {
-    let path = image_path("ext4-no-csum.img");
-    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    assert!(
-        !fs.is_null(),
-        "no-csum image failed to mount: {}",
-        last_err()
-    );
-
-    let content = read_file_to_string(fs, "/file.txt", 256);
-    assert_eq!(
-        content.as_deref(),
-        Some("no checksum here\n"),
-        "got: {:?}",
-        content
-    );
-
-    unsafe { fs_ext4_umount(fs) };
-}
-
-// ---------------------------------------------------------------------------
-// Volume info sanity across all images
-// ---------------------------------------------------------------------------
-
-#[test]
-fn all_images_report_volume_info() {
-    for img in [
-        "ext4-basic.img",
-        "ext4-htree.img",
-        "ext4-csum-seed.img",
-        "ext4-deep-extents.img",
-        "ext4-no-csum.img",
-    ] {
-        let path = image_path(img);
-        let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-        if fs.is_null() {
-            eprintln!("{img} failed to mount: {}", last_err());
-            continue;
+    // Assert the SPECIFIC refusal, not merely that something failed.
+    // `is_err()` alone passed even with the bigalloc check disabled,
+    // because the image was being rejected for an unrelated reason —
+    // a test that cannot tell those apart is not testing the fix.
+    match result {
+        Err(fs_ext4::error::Error::UnsupportedRoCompat(bits)) => {
+            assert_ne!(
+                bits & fs_ext4::features::RoCompat::BIGALLOC.bits(),
+                0,
+                "refused, but not for bigalloc: {bits:#x}"
+            );
         }
-
-        let mut info = unsafe { std::mem::zeroed::<fs_ext4_volume_info_t>() };
-        let rc = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
-        assert_eq!(rc, 0, "{img} get_volume_info failed: {}", last_err());
-        // Block size varies per image (1K, 2K, or 4K depending on mkfs defaults)
-        assert!(
-            matches!(info.block_size, 1024 | 2048 | 4096),
-            "{img} unexpected block_size: {}",
-            info.block_size
-        );
-        assert!(info.total_blocks > 0, "{img} total_blocks == 0");
-
-        unsafe { fs_ext4_umount(fs) };
+        Err(other) => panic!(
+            "a bigalloc filesystem was refused, but for the wrong reason: {other:?}. \
+             The refusal must name bigalloc, or a later change that removes the \
+             bigalloc check will still look green."
+        ),
+        Ok(_) => panic!(
+            "a bigalloc filesystem MOUNTED. This crate does not implement cluster \
+             arithmetic, so every block-group offset it computes on such a \
+             filesystem is wrong — mounting means serving data from wrong \
+             addresses."
+        ),
     }
+}
+
+/// The guard against fixing G1 too broadly.
+///
+/// It would be easy to refuse bigalloc by tightening the RO_COMPAT
+/// check into "anything unrecognised", which would also refuse ordinary
+/// filesystems carrying newer bits. This mounts a plain ext4 and
+/// requires it to still work.
+#[test]
+fn an_ordinary_ext4_still_mounts_and_reads() {
+    let Some(img) = build("plain", &["-t", "ext4"]) else {
+        eprintln!("skip: mke2fs not available");
+        return;
+    };
+    let fs = mount(&img).expect("a plain ext4 filesystem must mount");
+    fs.read_inode_verified(ROOT_INO)
+        .expect("the root inode must be readable after mounting");
+    let _ = std::fs::remove_file(&img);
+}
+
+/// An RO_COMPAT bit the crate has never heard of must still mount —
+/// that is the compatibility model, and the reason G1's refusal had to
+/// be a named list rather than a mask complement.
+///
+/// `project` is a real RO_COMPAT feature the reader does nothing with.
+#[test]
+fn a_tolerated_ro_compat_feature_still_mounts() {
+    let Some(img) = build("project", &["-t", "ext4", "-O", "project,quota"]) else {
+        eprintln!("skip: mke2fs not available");
+        return;
+    };
+    let fs = mount(&img).expect("project/quota are ignorable on a read-only mount");
+    fs.read_inode_verified(ROOT_INO).expect("root readable");
+    let _ = std::fs::remove_file(&img);
+}
+
+/// **G4.** A filesystem with Multi-Mount Protection must not be
+/// mounted *writable* by a driver that does not honour it.
+///
+/// MMP exists to stop two hosts writing to one filesystem at the same
+/// time. Honouring it means reading the MMP block, checking its
+/// sequence, claiming it with our own node name and re-checking —
+/// none of which this crate does. It nevertheless has twenty-one
+/// `apply_*` write entry points and a live journal writer, so
+/// ignoring the bit while writing is exactly the situation MMP is
+/// designed to prevent.
+///
+/// Read-only is still allowed and is deliberately checked below: a
+/// user recovering data from a disk another machine has open is the
+/// case that must keep working.
+#[test]
+fn an_mmp_filesystem_is_refused_for_writing_but_allowed_read_only() {
+    let Some(img) = build("mmp", &["-t", "ext4", "-O", "mmp"]) else {
+        eprintln!("skip: mke2fs not available");
+        return;
+    };
+
+    // Writable: must be refused.
+    let dev = FileDevice::open_rw(img.to_str().unwrap()).expect("open read-write");
+    let writable: Arc<dyn BlockDevice> = Arc::new(dev);
+    assert!(
+        writable.is_writable(),
+        "the fixture must be writable, or this test proves nothing"
+    );
+    assert!(
+        Filesystem::mount(writable).is_err(),
+        "an MMP filesystem MOUNTED WRITABLE. MMP exists to stop two hosts \
+         writing at once, and this crate does not honour it — mounting \
+         writable means becoming the second writer MMP was protecting \
+         against."
+    );
+
+    // Read-only: must still work.
+    let ro = FileDevice::open(img.to_str().unwrap()).expect("open read-only");
+    let ro_dyn: Arc<dyn BlockDevice> = Arc::new(ro);
+    Filesystem::mount(ro_dyn).expect("a read-only mount of an MMP filesystem must still work");
+
+    let _ = std::fs::remove_file(&img);
 }

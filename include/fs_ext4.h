@@ -55,10 +55,19 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint64_t size;
-    uint32_t atime;
-    uint32_t mtime;
-    uint32_t ctime;
-    uint32_t crtime;        /* Creation time (ext4 extra) */
+    /* Seconds since the Unix epoch, signed and 64-bit.
+     *
+     * Widened from uint32_t in 0.6.0. ext4's on-disk base field is a
+     * SIGNED 32-bit value which the matching *_extra field extends by
+     * two further bits, so the real range is roughly 1901..2446. A
+     * uint32_t truncated everything past 2038 and turned every
+     * pre-1970 date into a far-future one.
+     *
+     * THIS CHANGES THE STRUCT LAYOUT. Recompile any consumer. */
+    int64_t  atime;
+    int64_t  mtime;
+    int64_t  ctime;
+    int64_t  crtime;        /* Creation time (ext4 extra) */
     uint16_t link_count;
     fs_ext4_file_type_t file_type;
     /* Sub-second timestamp precision (added in v0.3) */
@@ -576,15 +585,36 @@ int fs_ext4_setxattr(fs_ext4_fs_t *fs, const char *path,
 int fs_ext4_removexattr(fs_ext4_fs_t *fs, const char *path,
                         const char *name);
 
+/* Leave a timestamp unchanged: POSIX spells this UTIME_OMIT in the
+ * nanoseconds field; fs_ext4_utimens takes it in the seconds field.
+ * Not UINT32_MAX any more -- seconds are signed and 64-bit, which makes
+ * that value an ordinary date in 2106 rather than a spare bit pattern.
+ *
+ * A `static const` and not a `#define` so that Swift sees it. Swift's
+ * C importer takes simple literal macros only; `#define FS_EXT4_TIME_OMIT
+ * INT64_MIN` expands to an expression it declines to import, and the
+ * symbol is then simply absent on the Swift side. */
+static const int64_t FS_EXT4_TIME_OMIT = INT64_MIN;
+
 /* Set the access + modification times on `path`. Each `*_sec` is a
- * POSIX seconds-since-epoch value; passing UINT32_MAX leaves that pair
- * unchanged (so `atime_sec == UINT32_MAX` touches only mtime, etc).
- * `*_nsec` is sub-second nanoseconds, only written when the inode's
- * i_extra_isize region can hold them. Bumps i_ctime. Returns 0 on
- * success, -1 on failure. */
+ * POSIX seconds-since-epoch value; passing FS_EXT4_TIME_OMIT leaves that
+ * pair unchanged (so `atime_sec == FS_EXT4_TIME_OMIT` touches only
+ * mtime, etc). `*_nsec` is sub-second nanoseconds, only written when the
+ * inode's i_extra_isize region can hold them. Bumps i_ctime.
+ *
+ * The seconds are int64_t (widened from uint32_t in 0.5.0) because ext4
+ * stores a SIGNED 32-bit base extended by two epoch bits in the matching
+ * `*_extra` field -- roughly 1901..2446. The old unsigned type could
+ * express neither end: a pre-1970 date was unrepresentable, and a
+ * post-2038 date was written with the epoch bits left zero and read back
+ * 136 years early.
+ *
+ * Returns 0 on success, -1 on failure. Fails with EINVAL for a time
+ * outside that range, or for one needing the epoch bits on an inode too
+ * small to hold an `*_extra` field (128-byte inodes). */
 int fs_ext4_utimens(fs_ext4_fs_t *fs, const char *path,
-                    uint32_t atime_sec, uint32_t atime_nsec,
-                    uint32_t mtime_sec, uint32_t mtime_nsec);
+                    int64_t atime_sec, uint32_t atime_nsec,
+                    int64_t mtime_sec, uint32_t mtime_nsec);
 
 /* ---- Volume creation (mkfs) ---- */
 

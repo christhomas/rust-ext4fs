@@ -95,6 +95,15 @@ fn pack_nsec_lo(nsec: u32) -> u32 {
     (nsec & 0x3FFF_FFFF) << 2
 }
 
+/// Passed to [`Filesystem::apply_utimens`] in place of a seconds value
+/// to leave that timestamp unchanged — the equivalent of POSIX's
+/// `UTIME_OMIT`, which `utimensat(2)` spells in the nanoseconds field.
+///
+/// `i64::MIN` and not `u32::MAX`: seconds are signed and 64-bit, so
+/// `u32::MAX` is an ordinary date in 2106 and can no longer double as a
+/// sentinel. `i64::MIN` is far outside anything ext4 can store.
+pub const TIME_OMIT: i64 = i64::MIN;
+
 /// Split a `/a/b/c` path into (`/a/b`, `c`). Returns an error for empty or
 /// `"/"` paths (no basename to act on).
 fn split_parent_and_base(path: &str) -> Result<(String, String)> {
@@ -329,6 +338,31 @@ impl Filesystem {
         // so ext3 (whose journal inode uses legacy indirect block pointers)
         // works the same as ext4 (extent tree). The Phase A blanket refusal
         // of ext3 RW is therefore lifted.
+        // MMP — Multi-Mount Protection — exists to stop two hosts
+        // mounting one filesystem read-write at the same time and
+        // destroying it. Honouring it means reading the MMP block,
+        // checking its sequence, writing our own node name, waiting,
+        // and re-checking; none of that is implemented.
+        //
+        // Ignoring the bit is defensible for a read-only mount: a
+        // reader cannot corrupt anything, and the other host's
+        // protection is unaffected. It is NOT defensible the moment we
+        // are the one writing -- which this crate does, through
+        // twenty-one apply_* entry points and a live journal writer,
+        // both reached below on exactly this condition.
+        //
+        // So the refusal is scoped to the writable case. A read-only
+        // mount of an MMP filesystem still works, which is what a user
+        // recovering data from a disk another machine has open
+        // actually wants.
+        if fs.dev.is_writable()
+            && fs.sb.feature_incompat & crate::features::Incompat::MMP.bits() != 0
+        {
+            return Err(crate::error::Error::UnsupportedIncompat(
+                crate::features::Incompat::MMP.bits(),
+            ));
+        }
+
         if !defer_replay && fs.dev.is_writable() {
             // Best-effort: a replay failure here is logged via the returned
             // error but does NOT abort the mount, because many images have
@@ -2116,61 +2150,98 @@ impl Filesystem {
     /// Set the access + modification times on `path`. Mirrors POSIX
     /// `utimensat(2)`: `atime_sec/nsec` and `mtime_sec/nsec` each replace
     /// the inode's atime/mtime. `ctime` is bumped to now (POSIX requires
-    /// the change-time stamp on any attribute write). The `u32::MAX`
+    /// the change-time stamp on any attribute write). The [`TIME_OMIT`]
     /// sentinel on either `_sec` leaves that pair unchanged (lets callers
     /// touch just atime or just mtime).
+    ///
+    /// Seconds are signed and 64-bit because that is what the format
+    /// means: the on-disk base is a signed 32-bit count, extended by the
+    /// low two bits of the matching `*_extra` field. A `u32` here could
+    /// not express a pre-1970 date at all, and stored every date past
+    /// 2038 as one in the 1900s — the base was written and the epoch
+    /// bits left zero, so the value read back 136 years early.
     ///
     /// `nsec` values are the sub-second timestamp in nanoseconds and are
     /// only written when the inode's `i_extra_isize` region is large
     /// enough to hold them (requires ≥ 160-byte inodes — the ext4 tooling
-    /// default).
+    /// default). That same region holds the epoch bits, so on an inode
+    /// too small to carry it, a time needing them is refused rather than
+    /// silently stored as the wrong century.
     pub fn apply_utimens(
         &self,
         path: &str,
-        atime_sec: u32,
+        atime_sec: i64,
         atime_nsec: u32,
-        mtime_sec: u32,
+        mtime_sec: i64,
         mtime_nsec: u32,
     ) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
         }
+        for secs in [atime_sec, mtime_sec] {
+            if secs != TIME_OMIT
+                && !(crate::inode::MIN_ENCODABLE_TIME..=crate::inode::MAX_ENCODABLE_TIME)
+                    .contains(&secs)
+            {
+                return Err(Error::InvalidArgument(
+                    "timestamp outside the range ext4 can store (1901..2446)",
+                ));
+            }
+        }
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
-        if atime_sec != u32::MAX {
-            raw[0x08..0x0C].copy_from_slice(&atime_sec.to_le_bytes());
+        let (atime_base, atime_epoch) = crate::inode::encode_extra_time(atime_sec);
+        let (mtime_base, mtime_epoch) = crate::inode::encode_extra_time(mtime_sec);
+
+        // Extra-isize region carries the nsec fields AND the epoch bits.
+        // Offsets (relative to inode start):
+        //   0x84 i_ctime_extra  (needs i_extra_isize ≥  8)
+        //   0x88 i_mtime_extra  (needs i_extra_isize ≥ 12)
+        //   0x8C i_atime_extra  (needs i_extra_isize ≥ 16)
+        // Linux packs each as `(nsec << 2) | epoch_bits`.
+        let i_extra_isize = if raw.len() >= 0x82 {
+            u16::from_le_bytes(raw[0x80..0x82].try_into().unwrap())
+        } else {
+            0
+        };
+        let has_mtime_extra = i_extra_isize >= 12 && raw.len() >= 0x8C;
+        let has_atime_extra = i_extra_isize >= 16 && raw.len() >= 0x90;
+
+        // Refuse before writing anything, so a rejected call leaves the
+        // inode exactly as it was rather than half-updated.
+        if (mtime_sec != TIME_OMIT && mtime_epoch != 0 && !has_mtime_extra)
+            || (atime_sec != TIME_OMIT && atime_epoch != 0 && !has_atime_extra)
+        {
+            return Err(Error::InvalidArgument(
+                "timestamp past 2038 needs an *_extra field this inode is too small to hold",
+            ));
         }
-        if mtime_sec != u32::MAX {
-            raw[0x10..0x14].copy_from_slice(&mtime_sec.to_le_bytes());
+
+        if atime_sec != TIME_OMIT {
+            raw[0x08..0x0C].copy_from_slice(&atime_base.to_le_bytes());
+        }
+        if mtime_sec != TIME_OMIT {
+            raw[0x10..0x14].copy_from_slice(&mtime_base.to_le_bytes());
         }
         // POSIX: any attribute write bumps ctime.
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
 
-        // Extra-isize region carries the nsec fields on larger inodes.
-        // Offsets (relative to inode start):
-        //   0x84 i_ctime_extra  (needs i_extra_isize ≥  8)
-        //   0x88 i_mtime_extra  (needs i_extra_isize ≥ 12)
-        //   0x8C i_atime_extra  (needs i_extra_isize ≥ 16)
-        // Linux packs these as `(nsec << 2) | epoch_bits` — leave
-        // epoch_bits zero (matches the base 32-bit time counter's 2038
-        // range).
-        if raw.len() >= 0x82 {
-            let i_extra_isize = u16::from_le_bytes(raw[0x80..0x82].try_into().unwrap());
-            if i_extra_isize >= 8 && raw.len() >= 0x88 {
-                // Bump ctime_nsec to 0 alongside the ctime bump above.
-                raw[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
-            }
-            if mtime_sec != u32::MAX && i_extra_isize >= 12 && raw.len() >= 0x8C {
-                let packed = pack_nsec_lo(mtime_nsec);
-                raw[0x88..0x8C].copy_from_slice(&packed.to_le_bytes());
-            }
-            if atime_sec != u32::MAX && i_extra_isize >= 16 && raw.len() >= 0x90 {
-                let packed = pack_nsec_lo(atime_nsec);
-                raw[0x8C..0x90].copy_from_slice(&packed.to_le_bytes());
-            }
+        if i_extra_isize >= 8 && raw.len() >= 0x88 {
+            // Bump ctime_nsec to 0 alongside the ctime bump above. `now`
+            // is a u32 second count, so its epoch bits are zero until
+            // 2038 — see G6 in docs/format-conformance-gaps.md.
+            raw[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
+        }
+        if mtime_sec != TIME_OMIT && has_mtime_extra {
+            let packed = pack_nsec_lo(mtime_nsec) | mtime_epoch;
+            raw[0x88..0x8C].copy_from_slice(&packed.to_le_bytes());
+        }
+        if atime_sec != TIME_OMIT && has_atime_extra {
+            let packed = pack_nsec_lo(atime_nsec) | atime_epoch;
+            raw[0x8C..0x90].copy_from_slice(&packed.to_le_bytes());
         }
 
         self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
