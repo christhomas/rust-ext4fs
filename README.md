@@ -483,7 +483,7 @@ See `examples/capi_demo.rs` for the Rust-side equivalent.
 
 ```toml
 [dependencies]
-am-fs-ext4 = "0.3"
+am-fs-ext4 = "0.5"
 ```
 
 ```rust
