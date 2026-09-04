@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-04
+
+### Breaking
+
+- **`CachingDevice` is no longer part of this crate's public API.** It was
+  removed while deleting what a dead-code `allow` was hiding; the type lives in
+  `am-fs-core` now, where the other drivers were already getting it. The
+  functionality moved rather than disappearing, but
+  `fs_ext4::block_io::CachingDevice` no longer resolves, which is why this is a
+  minor rather than a patch — for a `0.x` crate cargo treats the minor as the
+  compatibility boundary. Nothing outside this repo referenced it.
+
+### Added
+
+- **`mkfs.ext4` is published as a downloadable binary.** A release job builds
+  the formatter, renames it from the cargo target `mkfs_ext4` to the dotted name
+  the format's convention uses — cargo refuses a dot in a target name — and
+  attaches a per-platform archive to the release, so a package manager can
+  install it without a Rust toolchain. The rename happens at package time rather
+  than in a downstream formula, so anyone downloading the archive directly gets
+  the real name.
+
+### Fixes
+
+- **A truncated inode read fails closed.** The checksum verifier accepted a
+  short read as a pass; it now refuses one, because a read that did not return
+  the bytes is not a checksum that matched.
+
+### Internal
+
+- Dependencies move to `am-fs-core` 0.2.4.
+
 ## [0.4.1] — 2026-08-29
 
 ### Fixes
