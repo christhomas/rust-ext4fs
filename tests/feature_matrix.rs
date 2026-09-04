@@ -172,3 +172,47 @@ fn a_tolerated_ro_compat_feature_still_mounts() {
     fs.read_inode_verified(ROOT_INO).expect("root readable");
     let _ = std::fs::remove_file(&img);
 }
+
+/// **G4.** A filesystem with Multi-Mount Protection must not be
+/// mounted *writable* by a driver that does not honour it.
+///
+/// MMP exists to stop two hosts writing to one filesystem at the same
+/// time. Honouring it means reading the MMP block, checking its
+/// sequence, claiming it with our own node name and re-checking —
+/// none of which this crate does. It nevertheless has twenty-one
+/// `apply_*` write entry points and a live journal writer, so
+/// ignoring the bit while writing is exactly the situation MMP is
+/// designed to prevent.
+///
+/// Read-only is still allowed and is deliberately checked below: a
+/// user recovering data from a disk another machine has open is the
+/// case that must keep working.
+#[test]
+fn an_mmp_filesystem_is_refused_for_writing_but_allowed_read_only() {
+    let Some(img) = build("mmp", &["-t", "ext4", "-O", "mmp"]) else {
+        eprintln!("skip: mke2fs not available");
+        return;
+    };
+
+    // Writable: must be refused.
+    let dev = FileDevice::open_rw(img.to_str().unwrap()).expect("open read-write");
+    let writable: Arc<dyn BlockDevice> = Arc::new(dev);
+    assert!(
+        writable.is_writable(),
+        "the fixture must be writable, or this test proves nothing"
+    );
+    assert!(
+        Filesystem::mount(writable).is_err(),
+        "an MMP filesystem MOUNTED WRITABLE. MMP exists to stop two hosts \
+         writing at once, and this crate does not honour it — mounting \
+         writable means becoming the second writer MMP was protecting \
+         against."
+    );
+
+    // Read-only: must still work.
+    let ro = FileDevice::open(img.to_str().unwrap()).expect("open read-only");
+    let ro_dyn: Arc<dyn BlockDevice> = Arc::new(ro);
+    Filesystem::mount(ro_dyn).expect("a read-only mount of an MMP filesystem must still work");
+
+    let _ = std::fs::remove_file(&img);
+}

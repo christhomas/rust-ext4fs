@@ -329,6 +329,31 @@ impl Filesystem {
         // so ext3 (whose journal inode uses legacy indirect block pointers)
         // works the same as ext4 (extent tree). The Phase A blanket refusal
         // of ext3 RW is therefore lifted.
+        // MMP — Multi-Mount Protection — exists to stop two hosts
+        // mounting one filesystem read-write at the same time and
+        // destroying it. Honouring it means reading the MMP block,
+        // checking its sequence, writing our own node name, waiting,
+        // and re-checking; none of that is implemented.
+        //
+        // Ignoring the bit is defensible for a read-only mount: a
+        // reader cannot corrupt anything, and the other host's
+        // protection is unaffected. It is NOT defensible the moment we
+        // are the one writing -- which this crate does, through
+        // twenty-one apply_* entry points and a live journal writer,
+        // both reached below on exactly this condition.
+        //
+        // So the refusal is scoped to the writable case. A read-only
+        // mount of an MMP filesystem still works, which is what a user
+        // recovering data from a disk another machine has open
+        // actually wants.
+        if fs.dev.is_writable()
+            && fs.sb.feature_incompat & crate::features::Incompat::MMP.bits() != 0
+        {
+            return Err(crate::error::Error::UnsupportedIncompat(
+                crate::features::Incompat::MMP.bits(),
+            ));
+        }
+
         if !defer_replay && fs.dev.is_writable() {
             // Best-effort: a replay failure here is logged via the returned
             // error but does NOT abort the mount, because many images have
