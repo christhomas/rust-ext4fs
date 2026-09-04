@@ -168,6 +168,35 @@ fn decode_extra_time(base: u32, extra: u32) -> i64 {
 /// Low two bits of an `*_extra` field: the seconds extension.
 const EXT4_EPOCH_MASK: u32 = 0x3;
 
+/// The inverse of [`decode_extra_time`]: split a POSIX seconds value
+/// into the on-disk base and the two epoch bits that belong in the low
+/// end of the matching `*_extra` field.
+///
+/// Matches `ext4_encode_extra_time` in `fs/ext4/ext4.h`:
+///
+/// ```c
+/// extra = ((time->tv_sec - (s32)time->tv_sec) >> 32) & EXT4_EPOCH_MASK;
+/// ```
+///
+/// The epoch bits account for the **signed** reinterpretation of the
+/// base, not merely for the bits above 32. 2100-01-01 is 4102444800,
+/// which fits in a `u32` but is negative as an `i32` — so it is stored
+/// as that negative base *plus* an epoch of 1, and the two cancel back
+/// to the right answer. Splitting the value at bit 32 instead would
+/// compute an epoch of 0 and store the wrong date.
+pub(crate) fn encode_extra_time(secs: i64) -> (u32, u32) {
+    let base = secs as u32;
+    let epoch = (((secs - (secs as i32 as i64)) >> 32) as u32) & EXT4_EPOCH_MASK;
+    (base, epoch)
+}
+
+/// The range [`encode_extra_time`] can represent: a signed 32-bit base
+/// plus two epoch bits, so 1901-12-13 through 2446-05-10. A caller
+/// asking to store a time outside this is asking for something the
+/// format cannot hold.
+pub(crate) const MIN_ENCODABLE_TIME: i64 = i32::MIN as i64;
+pub(crate) const MAX_ENCODABLE_TIME: i64 = i32::MAX as i64 + (3i64 << 32);
+
 impl Inode {
     /// Parse an inode from its on-disk bytes.
     /// Accepts any length >= 128; if >= 160 and i_extra_isize >= 28, parses the
@@ -427,11 +456,7 @@ mod timestamp_tests {
     /// so it is stored as that negative base *plus* an epoch of 1, and
     /// the two cancel back to the right answer. A test that split at
     /// bit 32 would compute epoch=0 and assert the wrong encoding.
-    fn encode(secs: i64) -> (u32, u32) {
-        let base = secs as u32;
-        let epoch = (((secs - (secs as i32 as i64)) >> 32) & 0x3) as u32;
-        (base, epoch)
-    }
+    use super::encode_extra_time as encode;
 
     #[test]
     fn a_date_in_2100_decodes_correctly() {

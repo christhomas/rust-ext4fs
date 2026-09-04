@@ -222,19 +222,22 @@ mod mountability_tests {
 
     /// Every other RO_COMPAT bit still mounts. The point is a targeted
     /// refusal, not a stricter filesystem.
+    /// Every tolerated RO_COMPAT bit mounts.
+    ///
+    /// Derived from `SUPPORTED_RO_COMPAT` rather than hand-listed. A
+    /// hand-written list is a second place to remember a bit, and the
+    /// one it forgot was GDT_CSUM: supported since the first release,
+    /// never asserted, so a regression rejecting it would have passed
+    /// this suite.
     #[test]
     fn the_other_ro_compat_bits_still_mount() {
-        for bit in [
-            RoCompat::SPARSE_SUPER.bits(),
-            RoCompat::LARGE_FILE.bits(),
-            RoCompat::HUGE_FILE.bits(),
-            RoCompat::DIR_NLINK.bits(),
-            RoCompat::EXTRA_ISIZE.bits(),
-            RoCompat::QUOTA.bits(),
-            RoCompat::METADATA_CSUM.bits(),
-            RoCompat::PROJECT.bits(),
-            RoCompat::ORPHAN_PRESENT.bits(),
-        ] {
+        let tolerated = SUPPORTED_RO_COMPAT & !READ_BREAKING_RO_COMPAT;
+        assert_ne!(tolerated, 0, "nothing to check — the masks are wrong");
+        for shift in 0..32 {
+            let bit = 1u32 << shift;
+            if tolerated & bit == 0 {
+                continue;
+            }
             check_mountable(0, bit)
                 .unwrap_or_else(|e| panic!("ro_compat {bit:#x} should mount read-only, got {e:?}"));
         }

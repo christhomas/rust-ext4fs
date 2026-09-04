@@ -2,13 +2,14 @@
 //!
 //! Covers:
 //! - atime + mtime round-trip via `fs_ext4_stat`.
-//! - `u32::MAX` sentinel on either _sec leaves the original alone.
+//! - `FS_EXT4_TIME_OMIT` on either _sec leaves the original alone.
 //! - ctime bumps on every call (POSIX requirement).
 //! - Missing-path / null-arg errnos.
 //! - RO (read-only) mount refuses with a non-zero errno.
 //! - Survives unmount → csum-validated remount.
 
 use fs_ext4::capi::*;
+use fs_ext4::fs::TIME_OMIT;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
@@ -51,20 +52,18 @@ fn utimens_sets_both_and_bumps_ctime() {
 
     // 2000-01-01 and 2000-01-02 — distinctive values far from the
     // build timestamp of the test image.
-    let a = 946_684_800u32;
-    let m = 946_771_200u32;
+    let a = 946_684_800i64;
+    let m = 946_771_200i64;
     let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), a, 0, m, 0) };
     assert_eq!(rc, 0);
     assert_eq!(fs_ext4_last_errno(), 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
-    // The attr struct widened to i64 in 0.6.0; the setter still takes
-    // u32 seconds, so the comparison crosses the widening deliberately.
-    assert_eq!(after.atime, i64::from(a));
-    assert_eq!(after.mtime, i64::from(m));
+    assert_eq!(after.atime, a);
+    assert_eq!(after.mtime, m);
     // ctime must be recent (now), not one of the values above.
-    assert!(after.ctime > i64::from(a));
-    assert!(after.ctime > i64::from(m));
+    assert!(after.ctime > a);
+    assert!(after.ctime > m);
 
     unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
@@ -79,14 +78,14 @@ fn utimens_atime_sentinel_leaves_atime_alone() {
     assert!(!fs_handle.is_null());
 
     let before = stat_attr(fs_handle, "/test.txt");
-    let fresh_m = 1_700_000_000u32;
+    let fresh_m = 1_700_000_000i64;
 
-    let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), u32::MAX, 0, fresh_m, 0) };
+    let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), TIME_OMIT, 0, fresh_m, 0) };
     assert_eq!(rc, 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
     assert_eq!(after.atime, before.atime, "atime preserved by sentinel");
-    assert_eq!(after.mtime, i64::from(fresh_m), "mtime applied");
+    assert_eq!(after.mtime, fresh_m, "mtime applied");
 
     unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
@@ -101,13 +100,13 @@ fn utimens_mtime_sentinel_leaves_mtime_alone() {
     assert!(!fs_handle.is_null());
 
     let before = stat_attr(fs_handle, "/test.txt");
-    let fresh_a = 1_700_000_000u32;
+    let fresh_a = 1_700_000_000i64;
 
-    let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), fresh_a, 0, u32::MAX, 0) };
+    let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), fresh_a, 0, TIME_OMIT, 0) };
     assert_eq!(rc, 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
-    assert_eq!(after.atime, i64::from(fresh_a), "atime applied");
+    assert_eq!(after.atime, fresh_a, "atime applied");
     assert_eq!(after.mtime, before.mtime, "mtime preserved by sentinel");
 
     unsafe { fs_ext4_umount(fs_handle) };
@@ -149,8 +148,8 @@ fn utimens_survives_remount_with_csum() {
 
     let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_handle.is_null());
-    let a = 1_500_000_000u32;
-    let m = 1_500_000_100u32;
+    let a = 1_500_000_000i64;
+    let m = 1_500_000_100i64;
     let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), a, 0, m, 0) };
     assert_eq!(rc, 0);
     unsafe { fs_ext4_umount(fs_handle) };
@@ -160,9 +159,97 @@ fn utimens_survives_remount_with_csum() {
     let after = stat_attr(fs2, "/test.txt");
     // The attr struct widened to i64 in 0.6.0; the setter still takes
     // u32 seconds, so the comparison crosses the widening deliberately.
-    assert_eq!(after.atime, i64::from(a));
-    assert_eq!(after.mtime, i64::from(m));
+    assert_eq!(after.atime, a);
+    assert_eq!(after.mtime, m);
     unsafe { fs_ext4_umount(fs2) };
 
+    let _ = fs::remove_file(&img);
+}
+
+/// A timestamp past 2038 must come back as itself.
+///
+/// The seconds field is signed on disk, so anything at or above
+/// 2^31 has to carry the epoch extension in the low two bits of the
+/// matching `*_extra` field. A setter that writes the base and leaves
+/// those bits zero stores a date in the 1900s instead.
+#[test]
+fn utimens_round_trips_a_date_past_2038() {
+    let img = scratch("post_2038");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let path_c = CString::new("/test.txt").unwrap();
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs_handle.is_null());
+
+    // 2046-01-01. Fits in a u32; negative when read as an i32, so it
+    // is stored as that negative base plus one epoch bit.
+    let t = 2_398_291_200i64;
+    let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), t, 0, t, 0) };
+    assert_eq!(rc, 0, "utimens failed: {}", fs_ext4_last_errno());
+
+    let after = stat_attr(fs_handle, "/test.txt");
+    assert_eq!(after.atime, t, "atime lost its epoch extension");
+    assert_eq!(after.mtime, t, "mtime lost its epoch extension");
+
+    unsafe { fs_ext4_umount(fs_handle) };
+    let _ = fs::remove_file(&img);
+}
+
+/// A time ext4 cannot represent is refused, not silently truncated.
+///
+/// The on-disk encoding is a signed 32-bit base plus two epoch bits,
+/// so roughly 1901-12-13 .. 2446-05-10. Now that the setter takes an
+/// `i64`, a caller can name a time outside that; storing it would wrap
+/// to some unrelated date.
+#[test]
+fn utimens_refuses_a_time_ext4_cannot_store() {
+    let img = scratch("out_of_range");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let path_c = CString::new("/test.txt").unwrap();
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs_handle.is_null());
+
+    let before = stat_attr(fs_handle, "/test.txt");
+
+    for (label, t) in [
+        ("year 3000", 32_503_680_000i64),
+        ("year 1800", -5_364_662_400i64),
+    ] {
+        let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), t, 0, t, 0) };
+        assert_eq!(rc, -1, "{label} should be refused");
+        assert_eq!(fs_ext4_last_errno(), 22, "{label} errno (EINVAL)");
+    }
+
+    // A refused call must leave the inode untouched.
+    let after = stat_attr(fs_handle, "/test.txt");
+    assert_eq!(after.atime, before.atime, "atime changed on a refused call");
+    assert_eq!(after.mtime, before.mtime, "mtime changed on a refused call");
+    assert_eq!(after.ctime, before.ctime, "ctime bumped on a refused call");
+
+    unsafe { fs_ext4_umount(fs_handle) };
+    let _ = fs::remove_file(&img);
+}
+
+/// A pre-1970 time round-trips as a negative value.
+///
+/// The base is signed, so this needs no epoch bits at all — it just
+/// needs the setter not to have taken a `u32`, which could not name it.
+#[test]
+fn utimens_round_trips_a_pre_1970_date() {
+    let img = scratch("pre_1970");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let path_c = CString::new("/test.txt").unwrap();
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs_handle.is_null());
+
+    // 1960-01-01.
+    let t = -315_619_200i64;
+    let rc = unsafe { fs_ext4_utimens(fs_handle, path_c.as_ptr(), t, 0, t, 0) };
+    assert_eq!(rc, 0, "utimens failed: {}", fs_ext4_last_errno());
+
+    let after = stat_attr(fs_handle, "/test.txt");
+    assert_eq!(after.atime, t, "a 1960 atime must stay in 1960");
+    assert_eq!(after.mtime, t, "a 1960 mtime must stay in 1960");
+
+    unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
 }
