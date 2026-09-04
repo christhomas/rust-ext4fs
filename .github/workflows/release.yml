@@ -13,7 +13,7 @@ env:
   # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
   # during local build/verify. Bump in lockstep with the am-fs-core version
   # constraint in Cargo.toml when releasing a new fs-ext4 minor.
-  FS_CORE_REF: v0.2.3
+  FS_CORE_REF: v0.2.4
 
 jobs:
   test:
