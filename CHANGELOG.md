@@ -16,6 +16,24 @@
   recompile, not merely relink.** `include/fs_ext4.h` is updated to
   match.
 
+- **`fs_ext4_utimens` takes `int64_t` seconds, and the "leave unchanged"
+  sentinel moves.** The setter took `uint32_t`, which could not name a
+  pre-1970 time and — worse — wrote a post-2038 time into the signed base
+  field with the epoch bits left zero. With the reader above now decoding
+  those bits, setting an mtime of 2046 and reading it back gave 1909,
+  from a call that returned success. `UINT32_MAX` was the sentinel meaning
+  "leave this timestamp alone"; under a signed 64-bit parameter it is an
+  ordinary date in 2106, so the sentinel is now `FS_EXT4_TIME_OMIT`
+  (`INT64_MIN`). A time outside what the format can store, or one needing
+  the epoch bits on a 128-byte inode with no `*_extra` field, is refused
+  with `EINVAL` before any byte is written. Callers must update both the
+  argument types and the sentinel.
+
+  The header declares the sentinel as `static const int64_t`, not a
+  `#define`: Swift's C importer accepts simple literal macros only and
+  silently drops `#define FS_EXT4_TIME_OMIT INT64_MIN`, leaving the symbol
+  absent on the Swift side with no diagnostic.
+
 - **`CachingDevice` is no longer part of this crate's public API.** It was
   removed while deleting what a dead-code `allow` was hiding; the type lives in
   `am-fs-core` now, where the other drivers were already getting it. The
