@@ -284,6 +284,25 @@ ticked. Numbering follows the plan doc.
 
 Highlights from the last 50 commits, grouped by date.
 
+### 2026-09-04 — 0.5.0 — the formatter ships as a binary, and one type moves out
+
+- **Breaking:** `CachingDevice` is no longer part of this crate's public
+  API. It was removed while deleting what a dead-code `allow` was hiding;
+  the type lives in `am-fs-core`, where the other drivers already got it.
+  The functionality moved rather than disappearing, but
+  `fs_ext4::block_io::CachingDevice` no longer resolves — which for a
+  `0.x` crate is a minor bump, since cargo treats the minor as the
+  compatibility boundary. Nothing outside this repo referenced it.
+- `mkfs.ext4` is now published as a downloadable binary. A release job
+  builds it, renames the cargo target `mkfs_ext4` to the dotted name the
+  format's convention uses — cargo refuses a dot in a target name — and
+  attaches a per-platform archive, so a package manager can install it
+  without a Rust toolchain.
+- A truncated inode read now fails closed. The checksum verifier had
+  accepted a short read as a pass; a read that did not return the bytes
+  is not a checksum that matched.
+- Dependencies move to `am-fs-core` 0.2.4.
+
 ### 2026-08-29 — 0.4.1 — the multi-group formatter in front of e2fsck
 
 - `mkfs` output is now checked against `e2fsck` at three and five block
