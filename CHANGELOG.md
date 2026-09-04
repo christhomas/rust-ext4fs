@@ -6,6 +6,16 @@
 
 ### Breaking
 
+- **The C attribute struct's timestamps widen to `int64_t`.**
+  `fs_ext4_attr_t`'s `atime`/`mtime`/`ctime`/`crtime` were `uint32_t`.
+  ext4's on-disk base field is a *signed* 32-bit value which the
+  matching `*_extra` field extends by two further bits, so the real
+  range is roughly 1901..2446 — a `uint32_t` truncated everything past
+  2038 and turned every pre-1970 date into a far-future one.
+  **This moves every field after them in the struct: consumers must
+  recompile, not merely relink.** `include/fs_ext4.h` is updated to
+  match.
+
 - **`CachingDevice` is no longer part of this crate's public API.** It was
   removed while deleting what a dead-code `allow` was hiding; the type lives in
   `am-fs-core` now, where the other drivers were already getting it. The
@@ -26,6 +36,43 @@
 
 ### Fixes
 
+Four of these come from `docs/format-conformance-gaps.md`, which
+catalogues places the reader accepted a filesystem it could not read
+correctly. They share a failure mode: the mount succeeded and the
+wrongness appeared later as data rather than as an error.
+
+- **A bigalloc filesystem is refused rather than misread.** bigalloc
+  moves the allocation unit from the block to the cluster, so a reader
+  assuming they are the same computes every block-group offset wrong.
+  Measured: with the refusal disabled, such an image fails with
+  `BadChecksum { what: "block group descriptor" }` — the misreading
+  caught in the act, and caught only because `metadata_csum` happened
+  to be on. Without it the wrong read returns silently.
+
+  The refusal is a named list, not "anything unrecognised": an unknown
+  RO_COMPAT bit must still mount, which is the compatibility model.
+  (The mask that previously claimed to control this was dead code —
+  the check ignored its argument entirely.)
+
+- **Timestamps apply the epoch-extension bits and are read as signed.**
+  The `*_extra` fields were read only for their nanosecond half by
+  `>> 2`; the seconds extension lives in exactly the two bits that
+  discards. Every timestamp past 2038 came back 136 years early, and
+  every pre-1970 date came back as one in 2106.
+
+- **A missing or short inline-data spill is corruption, not an empty
+  tail.** An inline file over 60 bytes stores its remainder in the
+  `system.data` xattr. If that xattr was absent the read silently
+  returned only the first 60 bytes — for a file whose size field still
+  claimed the full length, so nothing downstream could detect the
+  truncation.
+
+- **A writable mount of an MMP filesystem is refused.** Multi-Mount
+  Protection stops two hosts writing to one filesystem at once, and is
+  not implemented. Read-only mounts are unaffected and still work,
+  which is what recovering data from a disk another machine has open
+  requires.
+
 - **A truncated inode read fails closed.** The checksum verifier accepted a
   short read as a pass; it now refuses one, because a read that did not return
   the bytes is not a checksum that matched.
@@ -33,6 +80,10 @@
 ### Internal
 
 - Dependencies move to `am-fs-core` 0.2.4.
+- `tests/feature_matrix.rs` builds a filesystem with each feature via
+  `mke2fs` and asserts the crate either reads it correctly or refuses
+  it. Every gap fixed above was found by reading code, not by a test
+  failing; this is the test that would have caught them.
 
 ## [0.4.1] — 2026-08-29
 
