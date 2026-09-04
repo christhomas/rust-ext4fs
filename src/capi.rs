@@ -165,10 +165,17 @@ pub struct fs_ext4_attr_t {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
-    pub atime: u32,
-    pub mtime: u32,
-    pub ctime: u32,
-    pub crtime: u32,
+    /// Seconds since the Unix epoch, signed and 64-bit.
+    ///
+    /// Widened from `u32` in 0.6.0. ext4's on-disk base field is a
+    /// SIGNED 32-bit value which the matching `*_extra` field extends
+    /// by two further bits, so the real range is roughly 1901..2446.
+    /// A `u32` here truncated everything past 2038 and turned every
+    /// pre-1970 date into a far-future one.
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub crtime: i64,
     pub link_count: u16,
     pub file_type: fs_ext4_file_type_t,
     /// Sub-second nanoseconds for atime/mtime/ctime/crtime (0 for old inodes).

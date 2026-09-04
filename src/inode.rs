@@ -114,11 +114,19 @@ pub struct Inode {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
-    pub atime: u32,
-    pub mtime: u32,
-    pub ctime: u32,
-    pub dtime: u32,
-    pub crtime: u32,
+    /// Seconds since the Unix epoch, **signed and 64-bit**.
+    ///
+    /// The on-disk base field is a signed 32-bit value, so dates before
+    /// 1970 are representable and must not be read as far-future ones.
+    /// When `i_extra_isize` is large enough, the low two bits of the
+    /// matching `*_extra` field extend the seconds by `<< 32`, widening
+    /// the range from 1901..2038 to roughly 1901..2446. Both are
+    /// applied here; see `decode_extra_time`.
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub dtime: i64,
+    pub crtime: i64,
     pub atime_nsec: u32,
     pub mtime_nsec: u32,
     pub ctime_nsec: u32,
@@ -134,6 +142,32 @@ pub struct Inode {
     pub checksum: u32,
 }
 
+/// Combine a base timestamp with its `*_extra` field.
+///
+/// ext4 stores seconds in two places once `i_extra_isize` is large
+/// enough. The base field is a **signed** 32-bit count from the Unix
+/// epoch — negative values are dates before 1970 and are legal. The
+/// `*_extra` field packs two things: its **low two bits extend the
+/// seconds by 2^32**, and the upper thirty are nanoseconds.
+///
+/// Reading only the base gives 1901..2038. Adding the two epoch bits
+/// gives roughly 1901..2446, which is what the format actually means.
+/// The nanosecond half was already being read (`extra >> 2`); the
+/// epoch half was discarded, so every timestamp past 2038 came back
+/// 136 years early.
+///
+/// Matches `ext4_decode_extra_time` in `fs/ext4/ext4.h`.
+fn decode_extra_time(base: u32, extra: u32) -> i64 {
+    // The base is signed on disk: reinterpret before widening, or a
+    // pre-1970 date becomes a date in 2106.
+    let secs = base as i32 as i64;
+    let epoch_bits = (extra & EXT4_EPOCH_MASK) as i64;
+    secs + (epoch_bits << 32)
+}
+
+/// Low two bits of an `*_extra` field: the seconds extension.
+const EXT4_EPOCH_MASK: u32 = 0x3;
+
 impl Inode {
     /// Parse an inode from its on-disk bytes.
     /// Accepts any length >= 128; if >= 160 and i_extra_isize >= 28, parses the
@@ -146,9 +180,9 @@ impl Inode {
         let mode = u16::from_le_bytes(raw[OFF_MODE..OFF_MODE + 2].try_into().unwrap());
         let uid_lo = u16::from_le_bytes(raw[0x02..0x04].try_into().unwrap());
         let size_lo = u32::from_le_bytes(raw[OFF_SIZE_LO..OFF_SIZE_LO + 4].try_into().unwrap());
-        let atime = u32::from_le_bytes(raw[OFF_ATIME..OFF_ATIME + 4].try_into().unwrap());
-        let ctime = u32::from_le_bytes(raw[OFF_CTIME..OFF_CTIME + 4].try_into().unwrap());
-        let mtime = u32::from_le_bytes(raw[OFF_MTIME..OFF_MTIME + 4].try_into().unwrap());
+        let atime_base = u32::from_le_bytes(raw[OFF_ATIME..OFF_ATIME + 4].try_into().unwrap());
+        let ctime_base = u32::from_le_bytes(raw[OFF_CTIME..OFF_CTIME + 4].try_into().unwrap());
+        let mtime_base = u32::from_le_bytes(raw[OFF_MTIME..OFF_MTIME + 4].try_into().unwrap());
         let dtime = u32::from_le_bytes(raw[0x14..0x18].try_into().unwrap());
         let gid_lo = u16::from_le_bytes(raw[0x18..0x1A].try_into().unwrap());
         let links_count = u16::from_le_bytes(
@@ -186,7 +220,13 @@ impl Inode {
         let mut mtime_nsec = 0u32;
         let mut ctime_nsec = 0u32;
         let mut crtime_nsec = 0u32;
-        let mut crtime = 0u32;
+        let mut crtime_base = 0u32;
+        // The `*_extra` words, zero when i_extra_isize is too small to
+        // hold them — which correctly yields no epoch extension.
+        let mut atime_extra = 0u32;
+        let mut mtime_extra = 0u32;
+        let mut ctime_extra = 0u32;
+        let mut crtime_extra = 0u32;
         let mut checksum_hi = 0u16;
 
         // Extra fields — only present when on-disk inode size is >= 160 AND
@@ -222,19 +262,28 @@ impl Inode {
                 );
             }
             if i_extra_isize >= 8 {
-                ctime_nsec = u32::from_le_bytes(raw[0x84..0x88].try_into().unwrap()) >> 2;
+                let extra = u32::from_le_bytes(raw[0x84..0x88].try_into().unwrap());
+                ctime_nsec = extra >> 2;
+                ctime_extra = extra;
             }
             if i_extra_isize >= 12 {
-                mtime_nsec = u32::from_le_bytes(raw[0x88..0x8C].try_into().unwrap()) >> 2;
+                let extra = u32::from_le_bytes(raw[0x88..0x8C].try_into().unwrap());
+                mtime_nsec = extra >> 2;
+                mtime_extra = extra;
             }
             if i_extra_isize >= 16 {
-                atime_nsec = u32::from_le_bytes(raw[0x8C..0x90].try_into().unwrap()) >> 2;
+                let extra = u32::from_le_bytes(raw[0x8C..0x90].try_into().unwrap());
+                atime_nsec = extra >> 2;
+                atime_extra = extra;
             }
             if i_extra_isize >= 20 {
-                crtime = u32::from_le_bytes(raw[OFF_CRTIME..OFF_CRTIME + 4].try_into().unwrap());
+                crtime_base =
+                    u32::from_le_bytes(raw[OFF_CRTIME..OFF_CRTIME + 4].try_into().unwrap());
             }
             if i_extra_isize >= 24 {
-                crtime_nsec = u32::from_le_bytes(raw[0x94..0x98].try_into().unwrap()) >> 2;
+                let extra = u32::from_le_bytes(raw[0x94..0x98].try_into().unwrap());
+                crtime_nsec = extra >> 2;
+                crtime_extra = extra;
             }
         }
 
@@ -243,11 +292,13 @@ impl Inode {
             uid: join16(uid_hi, uid_lo),
             gid: join16(gid_hi, gid_lo),
             size: join32(size_hi, size_lo),
-            atime,
-            mtime,
-            ctime,
-            dtime,
-            crtime,
+            atime: decode_extra_time(atime_base, atime_extra),
+            mtime: decode_extra_time(mtime_base, mtime_extra),
+            ctime: decode_extra_time(ctime_base, ctime_extra),
+            // dtime has no *_extra field in the format: deletion time
+            // is a plain signed 32-bit value with no epoch extension.
+            dtime: dtime as i32 as i64,
+            crtime: decode_extra_time(crtime_base, crtime_extra),
             atime_nsec,
             mtime_nsec,
             ctime_nsec,
@@ -309,6 +360,114 @@ fn join16(hi: u16, lo: u16) -> u32 {
 #[inline]
 fn join32<H: Into<u64>>(hi: H, lo: u32) -> u64 {
     (hi.into() << 32) | lo as u64
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::decode_extra_time;
+
+    /// With no `*_extra` field, a timestamp is the plain signed
+    /// 32-bit value — the pre-2038 behaviour, unchanged.
+    #[test]
+    fn without_an_extra_field_the_base_is_used_as_is() {
+        assert_eq!(decode_extra_time(0, 0), 0);
+        assert_eq!(decode_extra_time(946_684_800, 0), 946_684_800);
+    }
+
+    /// **The base field is signed.** A value with the top bit set is a
+    /// date before 1970, not a date in 2106. Reading it as `u32` was
+    /// the second half of this bug.
+    #[test]
+    fn a_pre_1970_timestamp_stays_negative() {
+        // -1 as a u32 bit pattern: 1969-12-31T23:59:59Z.
+        assert_eq!(decode_extra_time(0xFFFF_FFFF, 0), -1);
+        // 1901-12-13, the earliest a signed 32-bit count reaches.
+        assert_eq!(decode_extra_time(0x8000_0000, 0), i32::MIN as i64);
+    }
+
+    /// **The fix.** The low two bits of `*_extra` extend the seconds
+    /// by 2^32 each, moving the ceiling from 2038 to roughly 2446.
+    ///
+    /// Previously these bits were discarded by the `>> 2` that
+    /// extracts nanoseconds, so every timestamp past 2038 came back
+    /// 136 years early.
+    #[test]
+    fn the_epoch_bits_extend_the_range_past_2038() {
+        // epoch=1 adds 2^32 seconds.
+        assert_eq!(decode_extra_time(0, 0b01), 1i64 << 32);
+        assert_eq!(decode_extra_time(0, 0b10), 2i64 << 32);
+        assert_eq!(decode_extra_time(0, 0b11), 3i64 << 32);
+    }
+
+    /// The nanosecond bits must not leak into the seconds. `*_extra`
+    /// packs both, and only the low two bits are the epoch.
+    #[test]
+    fn the_nanosecond_bits_do_not_affect_the_seconds() {
+        // All thirty nsec bits set, epoch bits clear.
+        let nsec_only = 0xFFFF_FFFCu32;
+        assert_eq!(
+            decode_extra_time(1_000, nsec_only),
+            1_000,
+            "nanoseconds must not be added to the seconds"
+        );
+    }
+
+    /// A real post-2038 timestamp round-trips.
+    ///
+    /// Encoded the way the kernel does it, which is subtler than
+    /// splitting the value at bit 32:
+    ///
+    /// ```c
+    /// extra = ((time->tv_sec - (s32)time->tv_sec) >> 32) & EXT4_EPOCH_MASK;
+    /// ```
+    ///
+    /// The epoch bits account for the **signed** reinterpretation of
+    /// the base, not merely for bits above 32. 2100-01-01 is
+    /// 4102444800, which fits in a `u32` but is negative as an `i32` —
+    /// so it is stored as that negative base *plus* an epoch of 1, and
+    /// the two cancel back to the right answer. A test that split at
+    /// bit 32 would compute epoch=0 and assert the wrong encoding.
+    fn encode(secs: i64) -> (u32, u32) {
+        let base = secs as u32;
+        let epoch = (((secs - (secs as i32 as i64)) >> 32) & 0x3) as u32;
+        (base, epoch)
+    }
+
+    #[test]
+    fn a_date_in_2100_decodes_correctly() {
+        const SECS_2100: i64 = 4_102_444_800;
+        let (base, epoch) = encode(SECS_2100);
+        assert_eq!(epoch, 1, "2100 needs the epoch extension");
+        assert_eq!(
+            decode_extra_time(base, epoch),
+            SECS_2100,
+            "a date in 2100 must not come back 136 years early"
+        );
+    }
+
+    /// Round-trip across the interesting boundaries, so the encoder
+    /// and decoder are checked against each other rather than against
+    /// hand-computed constants.
+    #[test]
+    fn timestamps_round_trip_across_the_2038_boundary() {
+        for secs in [
+            i32::MIN as i64,       // 1901
+            -1,                    // 1969
+            0,                     // 1970
+            946_684_800,           // 2000
+            i32::MAX as i64,       // 2038-01-19, the old ceiling
+            i32::MAX as i64 + 1,   // one second past it
+            4_102_444_800,         // 2100
+            (1i64 << 33) + 12_345, // needs both epoch bits
+        ] {
+            let (base, epoch) = encode(secs);
+            assert_eq!(
+                decode_extra_time(base, epoch),
+                secs,
+                "round trip for {secs}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -183,7 +183,7 @@ fn create_sets_timestamps_to_now() {
     let before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as u32;
+        .as_secs() as i64;
 
     let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
@@ -195,7 +195,7 @@ fn create_sets_timestamps_to_now() {
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as u32
+        .as_secs() as i64
         + 1;
 
     for (label, ts) in [

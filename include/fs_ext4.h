@@ -55,10 +55,19 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint64_t size;
-    uint32_t atime;
-    uint32_t mtime;
-    uint32_t ctime;
-    uint32_t crtime;        /* Creation time (ext4 extra) */
+    /* Seconds since the Unix epoch, signed and 64-bit.
+     *
+     * Widened from uint32_t in 0.6.0. ext4's on-disk base field is a
+     * SIGNED 32-bit value which the matching *_extra field extends by
+     * two further bits, so the real range is roughly 1901..2446. A
+     * uint32_t truncated everything past 2038 and turned every
+     * pre-1970 date into a far-future one.
+     *
+     * THIS CHANGES THE STRUCT LAYOUT. Recompile any consumer. */
+    int64_t  atime;
+    int64_t  mtime;
+    int64_t  ctime;
+    int64_t  crtime;        /* Creation time (ext4 extra) */
     uint16_t link_count;
     fs_ext4_file_type_t file_type;
     /* Sub-second timestamp precision (added in v0.3) */

@@ -58,11 +58,13 @@ fn utimens_sets_both_and_bumps_ctime() {
     assert_eq!(fs_ext4_last_errno(), 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
-    assert_eq!(after.atime, a);
-    assert_eq!(after.mtime, m);
+    // The attr struct widened to i64 in 0.6.0; the setter still takes
+    // u32 seconds, so the comparison crosses the widening deliberately.
+    assert_eq!(after.atime, i64::from(a));
+    assert_eq!(after.mtime, i64::from(m));
     // ctime must be recent (now), not one of the values above.
-    assert!(after.ctime > a);
-    assert!(after.ctime > m);
+    assert!(after.ctime > i64::from(a));
+    assert!(after.ctime > i64::from(m));
 
     unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
@@ -84,7 +86,7 @@ fn utimens_atime_sentinel_leaves_atime_alone() {
 
     let after = stat_attr(fs_handle, "/test.txt");
     assert_eq!(after.atime, before.atime, "atime preserved by sentinel");
-    assert_eq!(after.mtime, fresh_m, "mtime applied");
+    assert_eq!(after.mtime, i64::from(fresh_m), "mtime applied");
 
     unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
@@ -105,7 +107,7 @@ fn utimens_mtime_sentinel_leaves_mtime_alone() {
     assert_eq!(rc, 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
-    assert_eq!(after.atime, fresh_a, "atime applied");
+    assert_eq!(after.atime, i64::from(fresh_a), "atime applied");
     assert_eq!(after.mtime, before.mtime, "mtime preserved by sentinel");
 
     unsafe { fs_ext4_umount(fs_handle) };
@@ -156,8 +158,10 @@ fn utimens_survives_remount_with_csum() {
     let fs2 = unsafe { fs_ext4_mount(img_c.as_ptr()) };
     assert!(!fs2.is_null(), "remount failed — inode csum not patched?");
     let after = stat_attr(fs2, "/test.txt");
-    assert_eq!(after.atime, a);
-    assert_eq!(after.mtime, m);
+    // The attr struct widened to i64 in 0.6.0; the setter still takes
+    // u32 seconds, so the comparison crosses the widening deliberately.
+    assert_eq!(after.atime, i64::from(a));
+    assert_eq!(after.mtime, i64::from(m));
     unsafe { fs_ext4_umount(fs2) };
 
     let _ = fs::remove_file(&img);
