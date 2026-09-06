@@ -190,6 +190,57 @@ elif [ -f Cargo.lock ]; then
   fi
 fi
 
+# ── 5. the lock must record the sibling version the workflows PIN ───────────
+# The gap part 4 leaves. It skips whenever an external path dep is present,
+# deferring to CI's --locked — and that is the one case where the lock and the
+# workflow can disagree without anything local noticing.
+#
+# HOW IT HAPPENS, and it happens constantly in multi-repo work: bump a sibling
+# in its own checkout, then run ANY cargo command in a consumer — a build, a
+# test, this hook's own clippy — and cargo re-resolves the path dependency and
+# rewrites the consumer's lock to the sibling's new version. Commit that, and
+# CI clones the sibling at the tag written in the workflow, finds a lock naming
+# a version that tag does not have, and stops at:
+#
+#   error: cannot update the lock file … because --locked was passed
+#
+# Which is the pin doing its job, several minutes into a run, after a push.
+# This says the same thing before the commit exists.
+if [ -f Cargo.lock ] && [ -d .github/workflows ]; then
+  while IFS= read -r toml; do
+    [ -f "$toml" ] || continue
+    # `name = { path = "../sibling", … }` — the crate key and the directory it
+    # points at, which is the sibling repository's name.
+    while IFS='|' read -r crate sib; do
+      [ -n "$crate" ] && [ -n "$sib" ] || continue
+      lockver=$(awk -v p="$crate" '
+        $0 == "name = \"" p "\"" { getline; if ($1 == "version") { gsub(/[":]/, "", $3); print $3; exit } }
+      ' Cargo.lock)
+      [ -n "$lockver" ] || continue
+      # Every tag the workflows name on a line that also names this sibling,
+      # plus the same via a *_REF variable defined in the workflow or chores.yml.
+      pins=$(grep -rhoE "v[0-9]+\.[0-9]+\.[0-9]+" \
+               <(grep -rhE "$sib(\.git)?([^A-Za-z0-9._-]|\$)" .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null) \
+             2>/dev/null | sort -u)
+      if printf '%s\n' "$pins" | grep -qE "^v${lockver}$"; then continue; fi
+      # A *_REF indirection: resolve every REF variable and try again.
+      refs=$(grep -rhoE "^[[:space:]]*[A-Z0-9_]+_REF:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+" \
+               .github/workflows/*.yml chores.yml 2>/dev/null | grep -oE "v[0-9]+\.[0-9]+\.[0-9]+" | sort -u)
+      if printf '%s\n' "$refs" | grep -qE "^v${lockver}$"; then continue; fi
+      # Nothing pinned for this sibling at all → not this check's business.
+      [ -n "$pins$refs" ] || continue
+      echo "[deps] Cargo.lock records $crate = $lockver, and no workflow pins that version." >&2
+      echo "       The workflows pin: $(printf '%s\n' $pins $refs | sort -u | tr '\n' ' ')" >&2
+      echo "       CI clones the sibling at its pinned tag and then refuses the lock:" >&2
+      echo "         error: cannot update the lock file … because --locked was passed" >&2
+      echo "       Fix EITHER side: move the pin to v$lockver, or restore the lock" >&2
+      echo "       (git checkout HEAD -- Cargo.lock) if the bump was accidental." >&2
+      fail=1
+    done < <(grep -vE '^[[:space:]]*#' "$toml" 2>/dev/null \
+              | sed -nE 's@^[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*\{[^}]*path[[:space:]]*=[[:space:]]*"\.\.?/([A-Za-z0-9._-]+)".*@\1|\2@p')
+  done < <(git ls-files '*Cargo.toml' 'Cargo.toml')
+fi
+
 if [ "$fail" != 0 ]; then
   echo "github-guard: rust-deps-pinned blocked the commit — pin your dependencies (above)." >&2
   echo "             Bypass once (NOT recommended): git commit --no-verify" >&2
