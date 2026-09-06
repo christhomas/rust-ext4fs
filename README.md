@@ -284,6 +284,19 @@ ticked. Numbering follows the plan doc.
 
 Highlights from the last 50 commits, grouped by date.
 
+### 2026-09-06 — 0.5.1 — what the image says is checked before it is believed
+
+- A journal entry that names a block outside the filesystem is refused
+  rather than replayed. Replay writes where the entry says it should, so
+  a crafted journal could write anywhere on the device.
+- The superblock fields a mount sizes itself from are bounded, so an
+  image cannot decide how much memory a mount spends.
+- A directory's declared size no longer drives an unbounded scan.
+- The allocator and the journal writer may not step outside the
+  filesystem.
+- A group descriptor's pointers are read as block numbers in this
+  filesystem, which is what they are.
+
 ### 2026-09-04 — 0.5.0 — the formatter ships as a binary, and one type moves out
 
 - **Breaking:** `CachingDevice` is no longer part of this crate's public
