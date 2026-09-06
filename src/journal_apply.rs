@@ -35,6 +35,52 @@ use crate::inode::Inode;
 use crate::jbd2::{self, JournalSuperblock};
 use crate::journal::ReplayPlan;
 
+/// Where a block number lands on the device, or a refusal.
+///
+/// Replay is the one operation that writes to a block number the image
+/// itself chose. It runs at mount, before anybody has asked for a file,
+/// and the number comes from a descriptor tag inside the journal --
+/// which is to say, from whoever wrote the image.
+///
+/// Two things go wrong when that number is taken on trust:
+///
+///   - a block past the end of the filesystem writes past the end of the
+///     device. Against a file-backed image that is not an error at all;
+///     the file simply grows, and a tag naming block 0xDEADBEEF turns a
+///     16 MiB image into a 15 TB one.
+///   - a block number above `2^64 / block_size` wraps. At a 4 KiB block
+///     size, block `2^52` multiplies out to exactly 0 -- the boot sector
+///     and the primary superblock -- and the replay overwrites them with
+///     contents the image supplied, then reports success.
+///
+/// Neither is a write to be clamped into range. A destination the
+/// filesystem does not contain means the journal is not describing this
+/// filesystem, so the replay stops and the mount fails rather than
+/// applying the part of it that happened to be in range.
+fn byte_offset_of(fs: &Filesystem, block: u64) -> Result<u64> {
+    if block >= fs.sb.blocks_count {
+        return Err(Error::Corrupt(
+            "journal_apply: journal names a block past the end of the filesystem",
+        ));
+    }
+    let block_size = fs.sb.block_size() as u64;
+    let offset = block
+        .checked_mul(block_size)
+        .ok_or(Error::Corrupt("journal_apply: block offset overflows"))?;
+    // `blocks_count` is the image's own claim about its size, so a
+    // truncated image passes the check above and still reaches past the
+    // device. The device is asked directly.
+    let end = offset
+        .checked_add(block_size)
+        .ok_or(Error::Corrupt("journal_apply: block offset overflows"))?;
+    if end > fs.dev.size_bytes() {
+        return Err(Error::Corrupt(
+            "journal_apply: journal names a block past the end of the device",
+        ));
+    }
+    Ok(offset)
+}
+
 /// Apply all writes in `plan` to `fs.dev`. Each `ReplayEntry` names a
 /// journal-block source and a fs-block destination; we read the source
 /// contents and overwrite the destination. Revoked writes are already
@@ -65,7 +111,7 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
         let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
             .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
         let mut buf = vec![0u8; block_size as usize];
-        fs.dev.read_at(phys * block_size, &mut buf)?;
+        fs.dev.read_at(byte_offset_of(fs, phys)?, &mut buf)?;
 
         // If the ESCAPED flag is set, the first 4 bytes of the journal block
         // were zeroed during write to keep them from colliding with the
@@ -75,7 +121,7 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
         }
 
         // Destination: fs_block * block_size = byte offset on the device.
-        fs.dev.write_at(w.fs_block * block_size, &buf)?;
+        fs.dev.write_at(byte_offset_of(fs, w.fs_block)?, &buf)?;
         applied += 1;
     }
 

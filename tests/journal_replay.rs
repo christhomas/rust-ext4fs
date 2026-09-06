@@ -195,3 +195,96 @@ fn read_only_device_skips_replay_silently() {
     }
     fs::remove_file(path).ok();
 }
+
+/// A journal names its destinations by block number, and those numbers
+/// come off the disk of the image being mounted.
+///
+/// Replay happens at mount, before anyone has asked for a file, so a
+/// destination the filesystem does not contain is not a write to be
+/// clamped -- it is evidence the journal is not describing this
+/// filesystem, and the whole replay has to stop. The two shapes below
+/// are the ones that reach past the device: a block number beyond the
+/// last one, and a block number large enough that multiplying it by the
+/// block size wraps and lands back near the start of the device, on the
+/// boot sector and the primary superblock.
+fn plan_writing_to(fs_block: u64) -> journal::ReplayPlan {
+    journal::ReplayPlan {
+        writes: vec![journal::ReplayEntry {
+            transaction: 1,
+            fs_block,
+            // Journal logical block 0 is the journal superblock. It is
+            // mapped, so the read half of the replay succeeds and the
+            // destination is what is left to judge.
+            journal_block: 0,
+            flags: 0,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn replay_refuses_a_destination_past_the_last_block() {
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
+    let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
+    let fs = Filesystem::mount(dev).expect("mount");
+
+    let before = fs::metadata(&path).expect("stat").len();
+    let past_the_end = fs.sb.blocks_count;
+    let outcome = journal_apply::apply(&fs, &plan_writing_to(past_the_end));
+
+    assert!(
+        outcome.is_err(),
+        "replay wrote to block {past_the_end}, which is past the last block of a \
+         {}-block filesystem",
+        fs.sb.blocks_count
+    );
+    drop(fs);
+    let after = fs::metadata(&path).expect("stat").len();
+    assert_eq!(
+        before, after,
+        "the image grew from {before} to {after} bytes -- the write landed \
+         past the end of the device"
+    );
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn replay_refuses_a_destination_whose_byte_offset_wraps() {
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
+    let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
+    let fs = Filesystem::mount(dev).expect("mount");
+    let block_size = fs.sb.block_size() as u64;
+
+    // The block number whose byte offset is exactly 2^64, which wraps to
+    // 0 -- the boot sector and the primary superblock.
+    let wraps_to_zero = (u64::MAX / block_size) + 1;
+    assert_eq!(
+        wraps_to_zero.wrapping_mul(block_size),
+        0,
+        "the block size {block_size} does not divide 2^64, so this test is \
+         not exercising the wrap it claims to"
+    );
+
+    let mut before = vec![0u8; block_size as usize];
+    fs.dev.read_at(0, &mut before).expect("read block 0");
+
+    let outcome = journal_apply::apply(&fs, &plan_writing_to(wraps_to_zero));
+    assert!(
+        outcome.is_err(),
+        "replay accepted block {wraps_to_zero}, whose byte offset wraps to 0"
+    );
+
+    let mut after = vec![0u8; block_size as usize];
+    fs.dev.read_at(0, &mut after).expect("read block 0");
+    assert_eq!(
+        before, after,
+        "block 0 -- the boot sector and the primary superblock -- was overwritten"
+    );
+
+    drop(fs);
+    fs::remove_file(path).ok();
+}
