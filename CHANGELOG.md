@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-09-06
+
+### Fixed
+
+- A journal entry that names a block outside the filesystem is refused
+  rather than replayed. Replay writes where the entry says, so a
+  crafted journal could write anywhere on the device.
+- The superblock fields a mount sizes itself from are bounded, so an
+  image cannot decide how much memory a mount spends.
+- A directory's declared size no longer drives an unbounded scan.
+- The allocator and the journal writer may not step outside the
+  filesystem.
+- A group descriptor's pointers are read as block numbers in this
+  filesystem rather than as offsets, which is what they are.
+
 ## [0.5.0] — 2026-09-04
 
 ### Breaking
