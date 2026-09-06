@@ -113,6 +113,18 @@ pub fn bit_is_set(bitmap: &[u8], idx: u32) -> bool {
 /// bitmaps (typical after mkfs) the scan is effectively memory-bandwidth
 /// bound and ~8–16× faster than per-bit `bit_is_set`.
 pub fn find_first_free(bitmap: &[u8], start: u32, max_bits: u32) -> Option<u32> {
+    // A BIT THAT IS NOT IN THE BITMAP IS NOT A FREE BIT.
+    //
+    // `bit_is_set` answers "not set" for an index past the end of the
+    // buffer, which reads as free, and `max_bits` comes from
+    // `s_blocks_per_group` / `s_inodes_per_group` -- superblock fields
+    // that nothing bounds to what a bitmap block can hold. So a group
+    // claiming 2^31 inodes per group returned bit indices that are not
+    // in its bitmap at all: the plan named a real inode or block, and
+    // the write that was supposed to mark it used silently did nothing
+    // while the counters were debited anyway. The next allocation then
+    // returned the same one.
+    let max_bits = max_bits.min(u32::try_from(bitmap.len().saturating_mul(8)).unwrap_or(u32::MAX));
     if start >= max_bits {
         return None;
     }
@@ -282,7 +294,13 @@ fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
     if gi + 1 < ngroups {
         return sb.blocks_per_group;
     }
-    let remainder = (sb.blocks_count - sb.first_data_block as u64) % sb.blocks_per_group as u64;
+    // Saturating: `s_first_data_block` is not among the fields
+    // `Superblock::parse` bounds, and a value above `blocks_count`
+    // wrapped this subtraction -- which made the last group's bit
+    // ceiling far larger than the group, so the allocator handed out
+    // blocks outside the filesystem.
+    let remainder =
+        sb.blocks_count.saturating_sub(sb.first_data_block as u64) % sb.blocks_per_group as u64;
     if remainder == 0 {
         sb.blocks_per_group
     } else {
@@ -332,12 +350,37 @@ where
             bitmap_reader(bgd.inode_bitmap)?
         };
 
-        let Some(bit_start) = find_first_free(&bitmap_bytes, 0, max_bits) else {
+        // THE RESERVED INODES ARE NOT AVAILABLE.
+        //
+        // Inodes below `s_first_ino` are the filesystem's own: 2 is the
+        // root directory, 8 the journal. On a filesystem mke2fs wrote
+        // their bits are set, so scanning from zero skipped them by
+        // accident -- but the bitmap is bytes off the disk, and one
+        // with those bits clear (or a group 0 flagged INODE_UNINIT,
+        // which is read as an all-zero bitmap without being read at
+        // all) handed out inode 2. `apply_create` then writes the new
+        // file's inode image over the root directory's.
+        let floor = if gi == 0 {
+            sb.first_inode.saturating_sub(1)
+        } else {
+            0
+        };
+        let Some(bit_start) = find_first_free(&bitmap_bytes, floor, max_bits) else {
             continue;
         };
 
         // Inode numbers are 1-based: first inode in group 0 is inode 1.
-        let inode = gi * sb.inodes_per_group + bit_start + 1;
+        // Checked, because `inodes_per_group` is a superblock field and
+        // the product wrapped in release -- a group-2 allocation came
+        // back as inode 2 and was written over the root inode while
+        // group 2's counters were debited.
+        let inode = u64::from(gi)
+            .checked_mul(u64::from(sb.inodes_per_group))
+            .and_then(|base| base.checked_add(u64::from(bit_start) + 1))
+            .filter(|n| *n <= u64::from(sb.inodes_count))
+            .ok_or(Error::Corrupt(
+                "the group's inode range does not fit in the filesystem",
+            ))? as u32;
 
         return Ok(InodeAllocationPlan {
             inode,
@@ -475,6 +518,68 @@ mod tests {
         }
     }
 
+    /// `bit_is_set` answers "not set" for an index past the end of the
+    /// buffer, which reads as free -- and `max_bits` comes from
+    /// `s_blocks_per_group` / `s_inodes_per_group`, superblock fields
+    /// that nothing bounds to what a bitmap block can hold.
+    ///
+    /// The plan then names a real inode or block while the write that
+    /// marks it used silently does nothing (the byte is past the
+    /// buffer), and the counters are debited anyway. The next
+    /// allocation returns the same one: every file on the same block,
+    /// every new inode over the last.
+    #[test]
+    fn a_bit_outside_the_bitmap_is_not_a_free_bit() {
+        // One byte of bitmap, every bit used, but a group claiming
+        // 2^31 bits.
+        let full = vec![0xFFu8];
+        assert_eq!(find_first_free(&full, 0, 1 << 31), None);
+        // And with room in the byte, only the bits that are there.
+        let partly = vec![0x0Fu8];
+        assert_eq!(find_first_free(&partly, 0, 1 << 31), Some(4));
+        assert_eq!(find_first_free(&partly, 8, 1 << 31), None);
+        // An empty bitmap has no free bits, however many are claimed.
+        assert_eq!(find_first_free(&[], 0, 1 << 31), None);
+    }
+
+    /// Inodes below `s_first_ino` are the filesystem's own: 2 is the
+    /// root directory, 8 the journal. On a filesystem mke2fs wrote,
+    /// their bits are set, so scanning from zero skipped them by
+    /// accident -- but the bitmap is bytes off the disk, and a group 0
+    /// flagged INODE_UNINIT is read as an all-zero bitmap without being
+    /// read at all.
+    #[test]
+    fn a_reserved_inode_is_never_allocated() {
+        let sb = mk_sb(1024, 8192, 128, 1024);
+        // Group 0 declared uninitialised, so its bitmap is taken as
+        // all-free without a device read.
+        let groups = vec![mk_bgd(100, 128, 0, BgdFlags::INODE_UNINIT.bits())];
+        assert_eq!(
+            sb.first_inode,
+            crate::superblock::GOOD_OLD_FIRST_INODE,
+            "the fixture superblock leaves s_first_ino zero; the floor comes from the parser"
+        );
+        let plan = plan_inode_allocation(&sb, &groups, false, 0, |_| {
+            panic!("an uninitialised group is not read")
+        })
+        .expect("a group with free inodes");
+        assert!(
+            plan.inode >= sb.first_inode,
+            "allocated inode {} , where the first non-reserved one is {} -- \
+             writing it puts the new file's inode over the root directory's",
+            plan.inode,
+            sb.first_inode
+        );
+
+        // Group 1 has no reserved inodes, so it starts at its first bit.
+        let groups = vec![
+            mk_bgd(100, 0, 0, 0),
+            mk_bgd(100, 128, 0, BgdFlags::INODE_UNINIT.bits()),
+        ];
+        let plan = plan_inode_allocation(&sb, &groups, false, 1, |_| unreachable!()).unwrap();
+        assert_eq!(plan.inode, 128 + 1);
+    }
+
     #[test]
     fn find_first_free_walks_bits() {
         let buf = vec![0xFF, 0x0F, 0x00]; // bits 0..11 set, 12..23 free
@@ -600,6 +705,14 @@ mod tests {
         assert_eq!(call_count, 0, "UNINIT group should not read bitmap");
     }
 
+    /// Inode numbers are one-based, and group 0's first *available*
+    /// one is `s_first_ino`.
+    ///
+    /// This used to assert inode 1, on an all-free bitmap that no real
+    /// filesystem has: mke2fs sets the reserved bits, so scanning from
+    /// zero returned 11 anyway and the assertion only held for the
+    /// synthetic bitmap here. It is the reserved range the allocator
+    /// must not enter, not the bits that happen to be set.
     #[test]
     fn inode_allocation_returns_one_based_number() {
         let sb = mk_sb(4096, 32768, 8192, 65536);
@@ -607,7 +720,11 @@ mod tests {
         let groups = vec![g0];
         let read = |_b| Ok(vec![0u8; 4096]);
         let plan = plan_inode_allocation(&sb, &groups, false, 0, read).unwrap();
-        assert_eq!(plan.inode, 1, "first inode in group 0 is ino 1");
+        assert_eq!(
+            plan.inode, sb.first_inode,
+            "group 0's first available inode is s_first_ino, not inode 1"
+        );
+        assert_eq!(plan.bitmap.bit_start, sb.first_inode - 1, "one-based");
         assert!(!plan.is_dir);
         assert_eq!(plan.bgd.used_dirs_delta, 0);
     }

@@ -130,6 +130,13 @@ pub(crate) fn classic_sparse_super(g: u64) -> bool {
 /// 6, which is a 64 KiB block.
 pub const MAX_LOG_BLOCK_SIZE: u32 = 6;
 
+/// The first inode a filesystem may hand out, before `s_first_ino`.
+///
+/// 11. Inodes 1 through 10 are the filesystem's own -- 2 is the root
+/// directory and 8 the journal -- and the kernel refuses a superblock
+/// whose `s_first_ino` is below it.
+pub const GOOD_OLD_FIRST_INODE: u32 = 11;
+
 impl Superblock {
     /// Read and parse the superblock from a block device.
     pub fn read<D: BlockDevice + ?Sized>(dev: &D) -> Result<Self> {
@@ -178,10 +185,15 @@ impl Superblock {
         // pin sensible defaults — `inode_size = 128` (the historical
         // ext2 size), `first_inode = 11` (the spec-defined start of
         // user-visible inodes; lower numbers are reserved).
+        // A `s_first_ino` below 11 would hand the reserved inodes -- 2
+        // is the root directory, 8 the journal -- to the allocator, so
+        // the kernel refuses one and this takes the floor rather than
+        // the field. Nothing legitimate writes a lower value; a
+        // filesystem that does is claiming its own root is available.
         let first_inode = if rev_level >= 1 {
-            u32::from_le_bytes(raw[0x54..0x58].try_into().unwrap())
+            u32::from_le_bytes(raw[0x54..0x58].try_into().unwrap()).max(GOOD_OLD_FIRST_INODE)
         } else {
-            11
+            GOOD_OLD_FIRST_INODE
         };
         let inode_size = if rev_level >= 1 {
             u16::from_le_bytes(raw[0x58..0x5A].try_into().unwrap())
