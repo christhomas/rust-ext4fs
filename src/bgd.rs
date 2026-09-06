@@ -119,9 +119,30 @@ pub fn read_all<D: BlockDevice + ?Sized>(
     let bgt_offset = bgt_block * block_size;
 
     let group_count = sb.block_group_count();
-    let total_bytes = (group_count as usize) * (sb.desc_size as usize);
+    // THE TABLE HAS TO BE INSIDE THE FILESYSTEM.
+    //
+    // `group_count` is `blocks_count / blocks_per_group`, both raw
+    // superblock fields, and `desc_size` is another. blocks_count 2^40
+    // with blocks_per_group 1 asked for 72 petabytes -- an allocation
+    // that aborts through `handle_alloc_error`, past `ffi_guard`'s
+    // `catch_unwind`, taking the host process with it. blocks_count
+    // u64::MAX wrapped the multiply instead and gave "capacity
+    // overflow". Both from a 4 MiB image, at mount.
+    let total_bytes = group_count
+        .checked_mul(sb.desc_size as u64)
+        .ok_or(Error::Corrupt(
+            "superblock: the group descriptor table's size overflows",
+        ))?;
+    let end = bgt_offset.checked_add(total_bytes).ok_or(Error::Corrupt(
+        "superblock: the group descriptor table's extent overflows",
+    ))?;
+    if end > dev.size_bytes() {
+        return Err(Error::Corrupt(
+            "superblock: the group descriptor table reaches past the end of the device",
+        ));
+    }
 
-    let mut buf = vec![0u8; total_bytes];
+    let mut buf = vec![0u8; total_bytes as usize];
     dev.read_at(bgt_offset, &mut buf)?;
 
     let mut groups = Vec::with_capacity(group_count as usize);

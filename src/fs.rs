@@ -578,6 +578,32 @@ impl Filesystem {
         if self.csum.enabled && !self.csum.verify_inode(ino, inode.generation, &raw) {
             return Err(Error::BadChecksum { what: "inode" });
         }
+        // A DIRECTORY IS NOT SPARSE.
+        //
+        // Every directory scan in this crate walks
+        // `0..size.div_ceil(block_size)` and steps over a logical block
+        // that is not mapped -- which is what the kernel does too, so
+        // the loop is never ended by an error and never bounded by real
+        // content. `i_size` is `join32(i_size_high, i_size_lo)` off the
+        // disk: setting `i_size_high` on the root of a small image gave
+        // a directory of 2^44 bytes and a lookup that was still
+        // spinning after twenty seconds, with `MAX_DIR_ENTRIES` never
+        // reached because no entry is ever found.
+        //
+        // A regular file may legitimately declare more bytes than the
+        // filesystem holds -- that is what a sparse file is -- but a
+        // directory's blocks are all really there.
+        if inode.is_dir() {
+            let filesystem_bytes = self
+                .sb
+                .blocks_count
+                .saturating_mul(self.sb.block_size() as u64);
+            if inode.size > filesystem_bytes {
+                return Err(Error::Corrupt(
+                    "directory inode declares more bytes than the filesystem holds",
+                ));
+            }
+        }
         Ok((inode, raw))
     }
 

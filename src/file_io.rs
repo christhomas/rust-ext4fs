@@ -131,6 +131,20 @@ pub fn read(
 /// the raw inode bytes (needed to read the in-inode xattr region holding
 /// data overflow).
 pub fn read_all(fs: &Filesystem, inode: &Inode) -> Result<Vec<u8>> {
+    // A whole-file read materialises the file, so it cannot need more
+    // memory than the filesystem has bytes. `inode.size` is
+    // `join32(i_size_high, i_size_lo)` straight off the disk with
+    // nothing comparing it to anything: setting `i_size_high` on a file
+    // in a 4 MiB image reached `memory allocation of
+    // 2305843009213694048 bytes failed` and took the process down --
+    // `handle_alloc_error` aborts, so `ffi_guard`'s `catch_unwind`
+    // never sees it.
+    let filesystem_bytes = fs.sb.blocks_count.saturating_mul(fs.sb.block_size() as u64);
+    if inode.size > filesystem_bytes {
+        return Err(Error::Corrupt(
+            "reading this file whole would need more memory than the filesystem has bytes",
+        ));
+    }
     let size = inode.size as usize;
     let mut buf = vec![0u8; size];
     let n = read(fs, inode, 0, size as u64, &mut buf)?;
