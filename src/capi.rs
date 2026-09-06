@@ -1271,6 +1271,18 @@ pub unsafe extern "C" fn fs_ext4_readlink(
 
             // Fast symlink: target < 60 bytes, stored inline in i_block.
             // Long symlink: target stored in data blocks, read via file_io.
+            // A symlink's target is a path, and no path is longer
+            // than PATH_MAX. Without this the raw `i_size` became the
+            // allocation below: a file patched to `i_mode = 0xA1FF`
+            // with `i_size = 0x2000_0000_0000_0060` aborted the process
+            // out of this very function.
+            if inode.size > 4096 {
+                set_last_error(format!(
+                    "readlink {path_str}: target of {} bytes is longer than any path",
+                    inode.size
+                ));
+                return -1;
+            }
             let target = if inode.size < 60 {
                 inode.block[..inode.size as usize].to_vec()
             } else {

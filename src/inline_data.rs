@@ -41,7 +41,11 @@ pub fn read_all(
     // Up to 60 bytes from i_block.
     let inline_max = 60;
     let from_block = total.min(inline_max);
-    let mut out = Vec::with_capacity(total);
+    // Reserved for what inline data can actually be -- the 60 bytes of
+    // i_block plus the in-inode xattr region, which is bounded by the
+    // inode size -- rather than for whatever `i_size` claimed. The
+    // vector grows to what is really there.
+    let mut out = Vec::with_capacity(total.min(64 * 1024));
     out.extend_from_slice(&inode.block[..from_block]);
 
     if total <= inline_max {

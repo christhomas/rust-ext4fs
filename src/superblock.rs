@@ -125,6 +125,11 @@ pub(crate) fn classic_sparse_super(g: u64) -> bool {
     g <= 1 || is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
 }
 
+/// The largest block ext4 defines, as its base-2 log over 1024.
+///
+/// 6, which is a 64 KiB block.
+pub const MAX_LOG_BLOCK_SIZE: u32 = 6;
+
 impl Superblock {
     /// Read and parse the superblock from a block device.
     pub fn read<D: BlockDevice + ?Sized>(dev: &D) -> Result<Self> {
@@ -271,12 +276,32 @@ impl Superblock {
         if inode_size == 0 {
             return Err(Error::Corrupt("superblock: inode_size == 0"));
         }
-        // log_block_size above 20 would produce a 1 GiB block — spec allows up
-        // to 64 KiB, anything larger is certainly a corrupt field. Guard here
-        // so `1024 << log_block_size` does not overflow u32 later.
-        if log_block_size > 20 {
+        // ext4 tops out at a 64 KiB block, which is `log_block_size = 6`.
+        // The guard used to admit 20, a 1 GiB block, on the argument that
+        // anything larger was "certainly a corrupt field" -- which is
+        // true of 20 as well. Every `vec![0u8; block_size]` in this
+        // crate is sized by this field, and `mount_inner` wraps the
+        // device in a 256-entry cache, so a 1 GiB block is 256 GiB of
+        // resident memory from a sparse image; three `read_block` calls
+        // allocated and zero-filled 3 GiB in five seconds. It is also
+        // what makes `ppb * ppb * ppb` overflow in the indirect-block
+        // map.
+        if log_block_size > MAX_LOG_BLOCK_SIZE {
             return Err(Error::Corrupt(
-                "superblock: log_block_size exceeds sane maximum",
+                "superblock: log_block_size exceeds the largest ext4 block",
+            ));
+        }
+        // 32 bytes without the 64BIT feature, 64 or more with it, and a
+        // power of two either way -- the kernel's own rule. The parser
+        // reads fixed offsets up to 0x20, and up to 0x3C when the field
+        // says 64, so a smaller value indexes past the buffer: 8 gave
+        // "range end index 12 out of range for slice of length 8" during
+        // mount.
+        let sixty_four_bit = feature_incompat & crate::features::Incompat::BIT64.bits() != 0;
+        let smallest = if sixty_four_bit { 64 } else { 32 };
+        if desc_size < smallest || !desc_size.is_power_of_two() {
+            return Err(Error::Corrupt(
+                "superblock: desc_size is not a group descriptor size",
             ));
         }
         if blocks_count == 0 {
