@@ -141,7 +141,18 @@ impl JournalWriter {
             self.jsb.sequence,
             self.block_size,
             self.jsb.uses_64bit(),
-            self.jsb.uses_csum_v2_or_v3(),
+            // CSUM_V3 ALONE. `Transaction::begin`'s last parameter is
+            // "does this journal use v3 tags", and it was handed "does
+            // this journal use checksums at all" -- so on a CSUM_V2
+            // journal the encoder laid 12/16-byte v3 tags while both
+            // this crate's reader (`journal.rs`, keyed on CSUM_V3) and
+            // the kernel parse 8/12-byte classical ones. Tag 0 aliases
+            // correctly, which hid it on single-block transactions;
+            // from tag 1 on, the reader takes the writer's zeroed
+            // checksum slot as `t_blocknr` -- fs block 0 -- so a
+            // recovery replays a data block onto the ext4 superblock.
+            // Every mkdir, create and unlink is multi-block.
+            self.jsb.uses_csum_v3(),
         )
     }
 

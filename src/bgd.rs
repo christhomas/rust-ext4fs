@@ -155,6 +155,36 @@ pub fn read_all<D: BlockDevice + ?Sized>(
             });
         }
         let bgd = BlockGroupDescriptor::parse(raw, sb.desc_size)?;
+        // THE THREE POINTERS ARE BLOCK NUMBERS IN THIS FILESYSTEM.
+        //
+        // `bg_block_bitmap`, `bg_inode_bitmap` and `bg_inode_table` are
+        // assembled lo|hi into a `u64` and were never checked against
+        // anything. Every one of them is a WRITE target:
+        // `set_block_run_used` and `free_block_run` write a whole block
+        // at the bitmaps, and `locate_inode` hands the table block to
+        // `write_inode_raw`, which writes an inode image there. A
+        // descriptor pointing outside the filesystem is trivially
+        // satisfied on an FSKit mount, where the device is larger than
+        // `s_blocks_count`, and `bg_block_bitmap_hi` set high also
+        // wrapped the unchecked `bitmap_block * block_size` at the use
+        // site. The only comparable check lived in fsck-only code.
+        //
+        // The inode table spans `inodes_per_group * inode_size` bytes,
+        // so it is the one that has to fit as a range rather than a
+        // point.
+        let table_blocks = (u64::from(sb.inodes_per_group) * u64::from(sb.inode_size))
+            .div_ceil(u64::from(sb.block_size()));
+        let past_the_end = bgd.block_bitmap >= sb.blocks_count
+            || bgd.inode_bitmap >= sb.blocks_count
+            || bgd
+                .inode_table
+                .checked_add(table_blocks)
+                .is_none_or(|end| end > sb.blocks_count);
+        if past_the_end {
+            return Err(Error::Corrupt(
+                "a block group descriptor points outside the filesystem",
+            ));
+        }
         groups.push(bgd);
     }
     Ok(groups)

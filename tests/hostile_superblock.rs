@@ -208,3 +208,58 @@ fn reading_a_file_whole_will_not_ask_for_more_memory_than_the_filesystem_holds()
     drop(fs);
     fs::remove_file(path).ok();
 }
+
+/// Group-descriptor field offsets, from the ext4 on-disk layout.
+mod bgd {
+    pub const BLOCK_BITMAP_LO: u64 = 0x00;
+    pub const INODE_TABLE_LO: u64 = 0x08;
+}
+
+/// Where the group descriptor table starts on the device.
+fn descriptor_table_at(path: &str) -> u64 {
+    let dev = FileDevice::open(path).expect("open");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
+    (fs.sb.first_data_block as u64 + 1) * fs.sb.block_size() as u64
+}
+
+fn patch_descriptor(path: &str, group: u64, field: u64, value: u32) {
+    let dev = FileDevice::open(path).expect("open");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
+    let desc_size = fs.sb.desc_size as u64;
+    drop(fs);
+    let at = descriptor_table_at(path) + group * desc_size + field;
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(&value.to_le_bytes()).unwrap();
+    f.flush().unwrap();
+}
+
+/// `bg_block_bitmap`, `bg_inode_bitmap` and `bg_inode_table` are block
+/// numbers in this filesystem, and every one of them is a write target:
+/// the bitmap writers put a whole block at the first two, and
+/// `locate_inode` hands the third to `write_inode_raw`, which writes an
+/// inode image there. None was checked against anything, and a
+/// descriptor pointing outside the filesystem is trivially satisfied on
+/// an FSKit mount, where the device is larger than `s_blocks_count`.
+#[test]
+fn a_group_descriptor_pointing_outside_the_filesystem_is_refused() {
+    for (what, field) in [
+        ("block bitmap", bgd::BLOCK_BITMAP_LO),
+        ("inode table", bgd::INODE_TABLE_LO),
+    ] {
+        let Some(path) = copy_to_tmp("bgdptr") else {
+            return;
+        };
+        patch_descriptor(&path, 0, field, 0x00FF_FFFF);
+        let why = mount_error(&path);
+        assert!(
+            why.contains("points outside the filesystem"),
+            "a {what} at block 0x00FFFFFF was answered with {why}"
+        );
+        fs::remove_file(path).ok();
+    }
+}

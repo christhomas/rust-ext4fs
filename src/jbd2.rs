@@ -114,6 +114,16 @@ impl JournalSuperblock {
     }
 
     /// Returns true if the journal uses v2 or v3 checksum tags.
+    /// Whether this journal uses the v3 tag layout.
+    ///
+    /// Distinct from [`Self::uses_csum_v2_or_v3`], which says whether it
+    /// is checksummed at all: the tag layout changes with V3 alone, and
+    /// confusing the two lays tags neither this crate's reader nor the
+    /// kernel can parse.
+    pub fn uses_csum_v3(&self) -> bool {
+        self.feature_incompat & JbdIncompat::CSUM_V3.bits() != 0
+    }
+
     pub fn uses_csum_v2_or_v3(&self) -> bool {
         self.feature_incompat & (JbdIncompat::CSUM_V2.bits() | JbdIncompat::CSUM_V3.bits()) != 0
     }
