@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "am-fs-core"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "am-fs-ext4"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "am-fs-core",
  "bitflags",
