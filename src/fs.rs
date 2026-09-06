@@ -377,7 +377,19 @@ impl Filesystem {
         // the JBD2 cursor from a clean state. Returns None when there is
         // no journal at all (ext2), so the if-let handles every flavor
         // uniformly.
-        if fs.dev.is_writable() {
+        //
+        // GATED ON `refuse_write` RATHER THAN ON THE DEVICE, so a volume
+        // carrying a feature this driver does not maintain does not get
+        // a live-write journal it will never be allowed to use.
+        //
+        // Journal REPLAY above is deliberately not gated the same way.
+        // Replay is a write, but it is the one write that adds nothing:
+        // it finishes transactions the filesystem itself already
+        // committed, including whatever the last writer did to the
+        // structures behind the unmaintained bit. Refusing it would
+        // leave a volume that reads its own stale metadata, which is a
+        // worse answer than the one it prevents.
+        if fs.refuse_write().is_ok() {
             if let Some(jw) = crate::journal_writer::JournalWriter::open(&fs)? {
                 fs.journal = Some(std::sync::Mutex::new(jw));
             }
@@ -388,7 +400,9 @@ impl Filesystem {
         // any inode still on the orphan chain at this point is genuinely
         // dead and we can reclaim it. Best-effort: a recovery failure
         // surfaces as an error but doesn't abort the mount.
-        if fs.dev.is_writable() && !defer_replay {
+        if !defer_replay {
+            // `recover_orphans` consults `refuse_write` itself and
+            // returns zero when it must not write.
             let _ = fs.recover_orphans();
         }
 
@@ -399,6 +413,37 @@ impl Filesystem {
     /// this on a clean (or read-only) volume is a no-op that returns 0.
     /// Designed to pair with [`Filesystem::mount_lazy`], but safe to call
     /// on any handle.
+    /// Refuse a write this driver cannot make consistently.
+    ///
+    /// Two reasons, and they are different in kind:
+    ///
+    /// - the device cannot be written at all;
+    /// - the volume carries a `RO_COMPAT` feature bit describing
+    ///   structures a write here would leave behind.
+    ///
+    /// The second is what the bit is FOR, and it was enforced nowhere.
+    /// `check_mountable` decides what may be read -- its own comment
+    /// says "mounted read-only" -- and this driver stopped being
+    /// read-only long ago. So an unrecognised bit permitted reading,
+    /// which is correct, and writing, which is the failure the bit
+    /// exists to prevent: the write updates what this driver knows
+    /// about and silently leaves the rest, and nothing reports it.
+    ///
+    /// `QUOTA` is the case to picture. It is tolerated for reading and
+    /// nothing here maintains the quota inodes, so a create charged
+    /// nobody for the file and left counters describing a filesystem
+    /// that no longer exists.
+    pub(crate) fn refuse_write(&self) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let unmaintained = features::unmaintained_ro_compat(self.sb.feature_ro_compat);
+        if unmaintained != 0 {
+            return Err(Error::UnsupportedRoCompat(unmaintained));
+        }
+        Ok(())
+    }
+
     pub fn replay_journal_if_dirty(&self) -> Result<usize> {
         let n = crate::journal_apply::replay_if_dirty(self)?;
         // Replay applied every pending journaled write to the data area,
@@ -465,7 +510,13 @@ impl Filesystem {
     /// so the orphans we're about to reclaim are guaranteed not still in
     /// use by an in-flight kernel-level transaction.
     pub fn recover_orphans(&self) -> Result<usize> {
-        if !self.dev.is_writable() {
+        // NOT AN ERROR HERE, unlike the other write paths. This runs
+        // from the mount path on every mount, and a volume that cannot
+        // be written -- or that this driver must not write, because it
+        // carries a feature it does not maintain -- simply keeps its
+        // orphans. Failing the mount over it would refuse a volume that
+        // reads perfectly well.
+        if self.refuse_write().is_err() {
             return Ok(0);
         }
         let chain = self.orphan_list()?;
@@ -712,9 +763,7 @@ impl Filesystem {
     /// the warning outlived it and was steering callers away from an API
     /// that is safe.
     pub fn apply_truncate_shrink(&self, ino: u32, new_size: u64) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
         if new_size > inode.size {
             return Err(Error::InvalidArgument(
@@ -777,9 +826,7 @@ impl Filesystem {
     /// `new_size == inode.size` this is a no-op that still bumps the
     /// timestamps — matches `truncate(2)` semantics.
     pub fn apply_truncate_grow(&self, ino: u32, new_size: u64) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
         if new_size < inode.size {
             return Err(Error::InvalidArgument(
@@ -813,9 +860,7 @@ impl Filesystem {
     ///   tree (or trigger the existing depth-1 promotion). Multi-level
     ///   trees aren't yet supported.
     pub fn apply_fallocate_keep_size(&self, ino: u32, offset: u64, len: u64) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         if len == 0 {
             return Ok(());
         }
@@ -938,9 +983,7 @@ impl Filesystem {
     /// - Indirect-block (ext2/3) inodes return EINVAL — punch is an
     ///   ext4-specific kernel API.
     pub fn apply_fallocate_punch_hole(&self, ino: u32, offset: u64, len: u64) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         if len == 0 {
             return Ok(());
         }
@@ -1086,9 +1129,7 @@ impl Filesystem {
     /// enabled mounts. Returns `Error::NotFound` if the path doesn't resolve,
     /// `Error::ReadOnly` on a RO mount.
     pub fn apply_chmod(&self, path: &str, mode: u16) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -1856,9 +1897,7 @@ impl Filesystem {
     /// Updates `i_ctime = now` and recomputes the inode checksum on
     /// csum-enabled mounts.
     pub fn apply_chown(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -1892,9 +1931,7 @@ impl Filesystem {
     /// corrupt the filesystem.
     pub fn apply_set_flags(&self, path: &str, flags: u32) -> Result<()> {
         use crate::inode::{InodeFlags, OFF_CTIME, OFF_FLAGS};
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -1934,9 +1971,7 @@ impl Filesystem {
     /// - `Error::NotFound` if the entry isn't present in either region.
     /// - `Error::InvalidArgument` on namespace-prefix issues.
     pub fn apply_removexattr(&self, path: &str, name: &str) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -2020,9 +2055,7 @@ impl Filesystem {
     ///    Returns `Error::NoSpaceLeftOnDevice` if even a full block can't
     ///    hold the new layout.
     pub fn apply_setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -2201,9 +2234,7 @@ impl Filesystem {
         mtime_sec: i64,
         mtime_nsec: u32,
     ) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         for secs in [atime_sec, mtime_sec] {
             if secs != TIME_OMIT
                 && !(crate::inode::MIN_ENCODABLE_TIME..=crate::inode::MAX_ENCODABLE_TIME)
@@ -2291,9 +2322,7 @@ impl Filesystem {
     /// `Error::NotADirectory` if the parent isn't a directory, and
     /// `Error::IsADirectory` (POSIX EISDIR) if the target is a directory.
     pub fn apply_unlink(&self, path: &str) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         // POSIX: a trailing slash asserts the path refers to a directory,
         // which is incompatible with `unlink(2)` no matter what kind of file
         // the path resolves to. `split_parent_and_base` swallows the slash,
@@ -2491,9 +2520,7 @@ impl Filesystem {
     /// - Not journaled — scratch-image safe, same caveat as other Phase-4
     ///   applies.
     pub fn apply_create(&self, path: &str, mode: u16) -> Result<u32> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let NewInodePlan {
             new_ino,
             parent_ino,
@@ -2545,9 +2572,7 @@ impl Filesystem {
     /// or `S_IFBLK`) plus the permission bits. `major` and `minor` are the
     /// device numbers (both 0 for FIFOs and sockets). Mirrors POSIX `mknod`.
     pub fn apply_mknod(&self, path: &str, mode: u16, major: u32, minor: u32) -> Result<u32> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let file_type = mode & crate::inode::S_IFMT;
         let dir_entry_type = match file_type {
             crate::inode::S_IFCHR => crate::dir::DirEntryType::CharDev,
@@ -2659,9 +2684,7 @@ impl Filesystem {
     /// POSIX caps symlink targets at SYMLINK_MAX (255 bytes on Linux +
     /// macOS). Longer returns `Error::NameTooLong` → ENAMETOOLONG.
     pub fn apply_symlink(&self, target: &str, linkpath: &str) -> Result<u32> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         if target.is_empty() {
             return Err(Error::InvalidArgument("symlink target is empty"));
         }
@@ -2884,9 +2907,7 @@ impl Filesystem {
     ///
     /// Returns the new file size on success.
     pub fn apply_replace_file_content(&self, path: &str, data: &[u8]) -> Result<u64> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -3168,9 +3189,7 @@ impl Filesystem {
     ///   existing")`. Skipping fallocate-then-write, the streaming
     ///   copy path doesn't trigger this.
     pub fn apply_pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<u64> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
@@ -3884,9 +3903,7 @@ impl Filesystem {
     /// Not journaled — safe only in scratch-image contexts until transaction
     /// wrapping lands.
     pub fn apply_mkdir(&self, path: &str, mode: u16) -> Result<u32> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let (parent_path, base_name) = split_parent_and_base(path)?;
         if base_name.len() > 255 {
             return Err(Error::NameTooLong);
@@ -4020,9 +4037,7 @@ impl Filesystem {
     ///
     /// Not journaled — same caveat as other Phase-4 ops.
     pub fn apply_link(&self, src: &str, dst: &str) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let (dst_parent_path, dst_name) = split_parent_and_base(dst)?;
         if dst_name.len() > 255 {
             return Err(Error::NameTooLong);
@@ -4142,9 +4157,7 @@ impl Filesystem {
     /// the guarantee is: **atomic unless the destination directory has
     /// to grow.**
     pub fn apply_rename(&self, src: &str, dst: &str, replace_if_exists: bool) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         if src == dst {
             return Ok(());
         }
@@ -4983,9 +4996,7 @@ impl Filesystem {
     /// only `.` and `..`. Frees the data block(s) + inode, removes the
     /// entry from the parent, decrements parent's `i_links_count`.
     pub fn apply_rmdir(&self, path: &str) -> Result<()> {
-        if !self.dev.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.refuse_write()?;
         let (parent_path, base_name) = split_parent_and_base(path)?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
         let parent_ino =

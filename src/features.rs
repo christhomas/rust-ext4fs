@@ -177,6 +177,50 @@ impl FsFlavor {
 /// refusing is the honest answer.
 pub const READ_BREAKING_RO_COMPAT: u32 = RoCompat::BIGALLOC.bits();
 
+/// RO_COMPAT bits this driver **maintains**, as opposed to tolerates.
+///
+/// [`SUPPORTED_RO_COMPAT`] is the read set: bits a reader may ignore.
+/// This is the smaller write set, and the difference between them is
+/// the point.
+///
+/// - `QUOTA` and `PROJECT` are absent because nothing here touches the
+///   quota inodes. The string "quota" appears in this file and nowhere
+///   else in `src/`. A create on a quota-enabled volume charges nobody
+///   for it and leaves counters that no longer describe the filesystem,
+///   which `e2fsck` reports later as a mismatch the user cannot connect
+///   to having plugged the disk into a Mac.
+/// - `ORPHAN_PRESENT` is absent for the same reason: the orphan file is
+///   read (see `Filesystem::orphan_list`) and not maintained.
+///
+/// Everything else in [`SUPPORTED_RO_COMPAT`] describes structures the
+/// write paths already keep correct.
+pub const MAINTAINED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
+    | RoCompat::LARGE_FILE.bits()
+    | RoCompat::HUGE_FILE.bits()
+    | RoCompat::GDT_CSUM.bits()
+    | RoCompat::DIR_NLINK.bits()
+    | RoCompat::EXTRA_ISIZE.bits()
+    | RoCompat::METADATA_CSUM.bits();
+
+/// The RO_COMPAT bits on this volume that a write here would not keep
+/// consistent: anything outside [`MAINTAINED_RO_COMPAT`].
+///
+/// # Why this is separate from [`check_mountable`]
+///
+/// `RO_COMPAT` names one rule with two halves — a reader that does not
+/// know the bit may READ, and must not WRITE. `check_mountable` decides
+/// the first half and its comments said so ("Check whether the
+/// filesystem can be mounted read-only"), but this driver has not been
+/// read-only for a long time: it creates, unlinks, writes, truncates,
+/// and formats. So the second half was not enforced anywhere, and a
+/// volume with an unrecognised bit was mounted writable with a test
+/// pinning that it should be.
+///
+/// Zero means the volume may be written.
+pub fn unmaintained_ro_compat(feature_ro_compat: u32) -> u32 {
+    feature_ro_compat & !MAINTAINED_RO_COMPAT
+}
+
 /// Check whether the filesystem can be mounted read-only.
 /// Returns Err with the unsupported bits if not.
 pub fn check_mountable(feature_incompat: u32, feature_ro_compat: u32) -> crate::error::Result<()> {
