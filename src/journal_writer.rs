@@ -71,6 +71,9 @@ pub struct JournalWriter {
     /// Cached JBD2 superblock — mutated in memory + flushed to disk on
     /// every commit. The on-disk truth always matches this between calls.
     jsb: JournalSuperblock,
+    /// How many blocks the filesystem has, so a write can be checked
+    /// against it after the mount has gone out of scope.
+    blocks_count: u64,
 }
 
 impl JournalWriter {
@@ -95,6 +98,19 @@ impl JournalWriter {
         // at 4 KiB blocks that's 8192 entries — tiny. Allocates once at
         // mount; every commit then does a constant-time index.
         let bs = fs.sb.block_size();
+        // A JOURNAL IS INSIDE THE FILESYSTEM IT JOURNALS.
+        //
+        // `s_maxlen` is a raw `u32` and nothing bounds it: 0xFFFFFFFF
+        // reserved 34 GB here before a block was mapped, which
+        // `handle_alloc_error` answers by aborting -- past
+        // `ffi_guard`'s `catch_unwind`, killing the host extension.
+        // The journal's blocks are filesystem blocks, so there cannot
+        // be more of them than the filesystem has.
+        if u64::from(jsb.max_len) > fs.sb.blocks_count {
+            return Err(Error::Corrupt(
+                "journal declares more blocks than the filesystem holds",
+            ));
+        }
         let mut physical_map = Vec::with_capacity(jsb.max_len as usize);
         for logical in 0..jsb.max_len as u64 {
             let phys = crate::indirect::map_logical_any(
@@ -111,6 +127,7 @@ impl JournalWriter {
         }
 
         Ok(Some(Self {
+            blocks_count: fs.sb.blocks_count,
             physical_map,
             block_size: bs,
             jsb,
@@ -168,15 +185,25 @@ impl JournalWriter {
             ));
         }
 
-        let bs_u64 = self.block_size as u64;
-
         // -- Step 1: write transaction blocks to journal at logical [1..1+N).
         //    Block 0 is the JBD2 superblock; we never overwrite it here.
         let txn_first_jblock = 1usize;
         for (i, block) in blocks.iter().enumerate() {
             let jblock_idx = txn_first_jblock + i;
             let phys = self.physical_map[jblock_idx];
-            dev.write_at(phys * bs_u64, block)?;
+            // The journal inode's extent tree says where its blocks
+            // are, and it is metadata off the disk like any other. The
+            // replay side checks this (`journal_apply::byte_offset_of`);
+            // the writer did not, so a journal inode mapping logical
+            // block 1 to fs block 0 put the first journalled operation's
+            // descriptor over the ext4 superblock.
+            let at = crate::journal_apply::byte_offset_in(
+                phys,
+                self.blocks_count,
+                self.block_size,
+                dev.size_bytes(),
+            )?;
+            dev.write_at(at, block)?;
         }
         dev.flush()?;
 
@@ -188,7 +215,13 @@ impl JournalWriter {
 
         // -- Step 3: apply writes to final-location fs blocks.
         for w in &tx.writes {
-            dev.write_at(w.fs_block * bs_u64, &w.bytes)?;
+            let at = crate::journal_apply::byte_offset_in(
+                w.fs_block,
+                self.blocks_count,
+                self.block_size,
+                dev.size_bytes(),
+            )?;
+            dev.write_at(at, &w.bytes)?;
         }
         dev.flush()?;
 

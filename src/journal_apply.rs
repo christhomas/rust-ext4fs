@@ -57,25 +57,42 @@ use crate::journal::ReplayPlan;
 /// filesystem does not contain means the journal is not describing this
 /// filesystem, so the replay stops and the mount fails rather than
 /// applying the part of it that happened to be in range.
-fn byte_offset_of(fs: &Filesystem, block: u64) -> Result<u64> {
-    if block >= fs.sb.blocks_count {
+pub(crate) fn byte_offset_of(fs: &Filesystem, block: u64) -> Result<u64> {
+    byte_offset_in(
+        block,
+        fs.sb.blocks_count,
+        fs.sb.block_size(),
+        fs.dev.size_bytes(),
+    )
+}
+
+/// The same rule, for callers that hold the pieces rather than the
+/// `Filesystem` -- `journal_writer` writes through a `&dyn BlockDevice`
+/// after the mount has gone out of scope.
+pub(crate) fn byte_offset_in(
+    block: u64,
+    blocks_count: u64,
+    block_size: u32,
+    device_bytes: u64,
+) -> Result<u64> {
+    if block >= blocks_count {
         return Err(Error::Corrupt(
-            "journal_apply: journal names a block past the end of the filesystem",
+            "journal: names a block past the end of the filesystem",
         ));
     }
-    let block_size = fs.sb.block_size() as u64;
+    let block_size = block_size as u64;
     let offset = block
         .checked_mul(block_size)
-        .ok_or(Error::Corrupt("journal_apply: block offset overflows"))?;
+        .ok_or(Error::Corrupt("journal: block offset overflows"))?;
     // `blocks_count` is the image's own claim about its size, so a
     // truncated image passes the check above and still reaches past the
     // device. The device is asked directly.
     let end = offset
         .checked_add(block_size)
-        .ok_or(Error::Corrupt("journal_apply: block offset overflows"))?;
-    if end > fs.dev.size_bytes() {
+        .ok_or(Error::Corrupt("journal: block offset overflows"))?;
+    if end > device_bytes {
         return Err(Error::Corrupt(
-            "journal_apply: journal names a block past the end of the device",
+            "journal: names a block past the end of the device",
         ));
     }
     Ok(offset)
