@@ -20,7 +20,7 @@ jobs:
       # Clone the sibling repo alongside so cargo can resolve it.
       # Anonymous HTTPS clone — rust-fs-core is public.
       - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.4 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.2.5 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -79,7 +79,7 @@ jobs:
       # The crate has a path dep on am-fs-core (../rust-fs-core).
       # Clone the sibling repo alongside so cargo can resolve it.
       - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.4 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.2.5 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install e2fsprogs
