@@ -73,9 +73,16 @@ impl fs_ext4::block_io::BlockDevice for MemDev {
 /// the superblock checksum restored, so the volume is well-formed and
 /// differs from the original only in the feature mask.
 fn fixture_with_ro_compat(bits: u32) -> Arc<MemDev> {
+    edited_fixture(bits, 0)
+}
+
+/// The same, with `clear` removed from the mask as well as `set` added.
+fn edited_fixture(set: u32, clear: u32) -> Arc<MemDev> {
     let mut bytes = std::fs::read(IMAGE).expect("read the fixture");
     let existing = u32::from_le_bytes(bytes[RO_COMPAT_AT..RO_COMPAT_AT + 4].try_into().unwrap());
-    bytes[RO_COMPAT_AT..RO_COMPAT_AT + 4].copy_from_slice(&(existing | bits).to_le_bytes());
+    let bits = set;
+    let updated = (existing | bits) & !clear;
+    bytes[RO_COMPAT_AT..RO_COMPAT_AT + 4].copy_from_slice(&updated.to_le_bytes());
 
     // METADATA_CSUM is set on this fixture, so the superblock carries a
     // checksum over everything before it. Leave it stale and the mount
@@ -158,4 +165,55 @@ fn a_default_volume_still_writes() {
     let fs = Filesystem::mount(MemDev::arc(bytes)).expect("mount");
     fs.apply_create("/guard_smoke.txt", 0o644)
         .expect("an ordinary volume must still accept a create");
+}
+
+/// A volume with `GDT_CSUM` and not `METADATA_CSUM` refuses a write.
+///
+/// This one was in the maintained set when the guard first landed, and
+/// it should not have been. The mistake is worth recording because the
+/// bit *looks* maintained from the feature table: group-descriptor
+/// checksums are computed and verified elsewhere in the crate, so it
+/// reads as covered.
+///
+/// It is not. `Checksummer::from_superblock` sets `enabled` from
+/// `METADATA_CSUM` alone, and the only writer of a descriptor checksum,
+/// `buffer_patch_bgd_counters`, sits behind `if self.csum.enabled`. So
+/// on a volume with `GDT_CSUM` and not `METADATA_CSUM` this driver
+/// edited group descriptors and left every checksum stale, which is the
+/// same shape of harm as the `QUOTA` case the guard was built for.
+///
+/// The two are not even the same algorithm: `METADATA_CSUM` descriptors
+/// are crc32c and `GDT_CSUM` descriptors are crc16, which this crate
+/// does not implement. So this is a refusal until that exists, not an
+/// oversight to be patched by flipping a flag.
+///
+/// `mke2fs` produced exactly this combination by default before 1.43,
+/// so the volume being refused here is an ordinary older disk rather
+/// than a contrived one.
+#[test]
+fn a_gdt_csum_volume_without_metadata_csum_refuses_a_write() {
+    let dev = edited_fixture(RoCompat::GDT_CSUM.bits(), RoCompat::METADATA_CSUM.bits());
+    let fs = Filesystem::mount(dev).expect("the volume must still be readable");
+
+    // Readable: the group descriptors parse and the root resolves.
+    let (inode, _raw) = fs.read_inode_verified(2).expect("read the root inode");
+    assert!(
+        inode.size > 0,
+        "the root inode came back describing nothing"
+    );
+
+    match fs.apply_create("/gdt_csum.txt", 0o644) {
+        Err(Error::UnsupportedRoCompat(bits)) => {
+            assert_eq!(
+                bits & RoCompat::GDT_CSUM.bits(),
+                RoCompat::GDT_CSUM.bits(),
+                "the refusal should name GDT_CSUM"
+            );
+        }
+        Err(other) => panic!("wrong refusal: {other:?}"),
+        Ok(_) => panic!(
+            "a create must be refused: this driver would leave every \
+             group-descriptor checksum it touched stale"
+        ),
+    }
 }
