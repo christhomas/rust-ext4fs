@@ -48,6 +48,21 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --release
 
+      # The shell that manages the oracle VM is not covered by `cargo
+      # test`, and its defects are the expensive kind: a slot that frees
+      # a lock being taken lets two 4 GB machines boot at once. Run every
+      # script here by glob, so a test added later needs no workflow
+      # change to be seen -- a guard that has to be registered somewhere
+      # else is a guard that gets silently skipped.
+      - name: VM slot and teardown semantics
+        run: |
+          set -euo pipefail
+          for t in tests/scripts/*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
       # `c_char` is signed on x86_64 and on Apple Silicon, and UNSIGNED on
       # aarch64-linux — so a `[0i8; N]` that builds everywhere we test can
       # still fail to compile for a real target. That is exactly what got
