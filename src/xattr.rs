@@ -28,6 +28,7 @@
 
 use crate::block_io::BlockDevice;
 use crate::error::{Error, Result};
+use crate::fs::Filesystem;
 use crate::inode::Inode;
 
 /// Magic number at the start of an xattr region (in-inode or external block).
@@ -59,7 +60,19 @@ pub struct XattrEntry {
     /// Fully-qualified name, e.g. "user.com.apple.FinderInfo".
     pub name: String,
     /// Raw value bytes (Finder uses binary data, ACLs are binary, etc.).
+    ///
+    /// **Empty when `value_inum` is non-zero**, because the bytes are not
+    /// in the region this was parsed from. See [`read_all`].
     pub value: Vec<u8>,
+    /// `e_value_inum`. Zero for an ordinary entry whose value is stored
+    /// inline. Non-zero when `INCOMPAT_EA_INODE` is in play and the value
+    /// lives in the file body of that inode instead — in which case
+    /// `e_value_offs` describes nothing and `value` above is empty.
+    ///
+    /// Resolving it needs a [`crate::fs::Filesystem`], which the
+    /// buffer-level parsers do not have; [`read_all_resolved`] is the
+    /// entry point that follows it.
+    pub value_inum: u32,
 }
 
 /// Read all extended attributes attached to an inode.
@@ -134,7 +147,7 @@ fn parse_entries(entries_buf: &[u8], _region_len: usize, out: &mut Vec<XattrEntr
         let name_index = entries_buf[pos + 1];
         let value_offs =
             u16::from_le_bytes(entries_buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
-        let _value_inum = u32::from_le_bytes(entries_buf[pos + 4..pos + 8].try_into().unwrap());
+        let value_inum = u32::from_le_bytes(entries_buf[pos + 4..pos + 8].try_into().unwrap());
         let value_size =
             u32::from_le_bytes(entries_buf[pos + 8..pos + 12].try_into().unwrap()) as usize;
         // pos+12..pos+16 = e_hash (ignored)
@@ -151,7 +164,14 @@ fn parse_entries(entries_buf: &[u8], _region_len: usize, out: &mut Vec<XattrEntr
             std::str::from_utf8(name_bytes).map_err(|_| Error::Corrupt("xattr name not utf-8"))?;
         let full_name = format!("{prefix}{suffix}");
 
-        let value = if value_size > 0 {
+        // AN EA-INODE ENTRY'S VALUE IS NOT HERE. `e_value_offs` describes
+        // nothing once `e_value_inum` is set, so slicing at it returns
+        // whatever happens to sit at that offset — quite possibly another
+        // attribute's value, which is worse than an error because the
+        // caller will act on it.
+        let value = if value_inum != 0 {
+            Vec::new()
+        } else if value_size > 0 {
             if value_offs + value_size > entries_buf.len() {
                 return Err(Error::Corrupt("xattr value out of range"));
             }
@@ -163,6 +183,7 @@ fn parse_entries(entries_buf: &[u8], _region_len: usize, out: &mut Vec<XattrEntr
         out.push(XattrEntry {
             name: full_name,
             value,
+            value_inum,
         });
 
         pos += entry_padded;
@@ -189,7 +210,7 @@ fn parse_entries_block(block: &[u8], out: &mut Vec<XattrEntry>) -> Result<()> {
         let name_len = block[pos] as usize;
         let name_index = block[pos + 1];
         let value_offs = u16::from_le_bytes(block[pos + 2..pos + 4].try_into().unwrap()) as usize;
-        let _value_inum = u32::from_le_bytes(block[pos + 4..pos + 8].try_into().unwrap());
+        let value_inum = u32::from_le_bytes(block[pos + 4..pos + 8].try_into().unwrap());
         let value_size = u32::from_le_bytes(block[pos + 8..pos + 12].try_into().unwrap()) as usize;
 
         let entry_size = 16 + name_len;
@@ -204,7 +225,11 @@ fn parse_entries_block(block: &[u8], out: &mut Vec<XattrEntry>) -> Result<()> {
             std::str::from_utf8(name_bytes).map_err(|_| Error::Corrupt("xattr name not utf-8"))?;
         let full_name = format!("{prefix}{suffix}");
 
-        let value = if value_size > 0 {
+        // See `parse_entries`: with `e_value_inum` set the value is in
+        // another inode's body, not at `e_value_offs` in this block.
+        let value = if value_inum != 0 {
+            Vec::new()
+        } else if value_size > 0 {
             if value_offs + value_size > block.len() {
                 return Err(Error::Corrupt("xattr block value out of range"));
             }
@@ -216,6 +241,7 @@ fn parse_entries_block(block: &[u8], out: &mut Vec<XattrEntry>) -> Result<()> {
         out.push(XattrEntry {
             name: full_name,
             value,
+            value_inum,
         });
 
         pos += entry_padded;
@@ -266,6 +292,7 @@ pub fn plan_remove_in_inode_region(region: &mut [u8], name: &str) -> Result<Remo
 
     // Decode every entry (header + name + value bytes).
     let entries = decode_in_inode_entries(&region[4..])?;
+    refuse_if_any_ea_inode_backed(&entries)?;
     let before = entries.len();
     let kept: Vec<DecodedEntry> = entries
         .into_iter()
@@ -323,6 +350,7 @@ pub fn plan_set_in_inode_region(region: &mut [u8], name: &str, value: &[u8]) -> 
     } else {
         Vec::new()
     };
+    refuse_if_any_ea_inode_backed(&entries)?;
 
     let mut outcome = SetOutcome::Inserted;
     let suffix_bytes = suffix.as_bytes();
@@ -338,6 +366,7 @@ pub fn plan_set_in_inode_region(region: &mut [u8], name: &str, value: &[u8]) -> 
             name_index,
             name_bytes: suffix_bytes.to_vec(),
             value: value.to_vec(),
+            value_inum: 0,
         });
     }
 
@@ -365,6 +394,39 @@ struct DecodedEntry {
     name_index: u8,
     name_bytes: Vec<u8>,
     value: Vec<u8>,
+    /// `e_value_inum`, carried so a rewrite can tell that it must not
+    /// happen. [`encode_in_inode_entries`] repacks every value into the
+    /// region, and a value that lives in another inode cannot be repacked;
+    /// emitting the entry without its pointer would leave it describing a
+    /// value that was never there and orphan the inode holding the real
+    /// one. See [`refuse_if_any_ea_inode_backed`].
+    value_inum: u32,
+}
+
+/// Refuse to rewrite a region that holds an EA-inode-backed entry.
+///
+/// # THIS IS NOT ONLY ABOUT THE ENTRY BEING EDITED
+///
+/// The in-inode region is rewritten wholesale: every surviving entry is
+/// re-encoded and every value repacked. So removing or setting attribute
+/// *A* re-emits attribute *B* too, and if B's value lives in an EA inode
+/// there is nothing to repack — B comes back with `e_value_inum` zeroed
+/// and an `e_value_offs` pointing at bytes that are not its value, while
+/// the inode holding the real value is orphaned with its refcount
+/// untouched and its blocks unfreed.
+///
+/// Following and refcounting EA inodes on the write path is the feature
+/// that would make this work. Until then, refusing is the honest answer,
+/// and it is the one this crate already gives for the other shapes it can
+/// read but not maintain.
+fn refuse_if_any_ea_inode_backed(entries: &[DecodedEntry]) -> Result<()> {
+    if entries.iter().any(|e| e.value_inum != 0) {
+        return Err(Error::Unsupported(
+            "this inode has an extended attribute whose value lives in an EA inode; \
+             rewriting the attribute area would orphan it",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse every entry out of the in-inode region's entries-area slice
@@ -381,13 +443,14 @@ fn decode_in_inode_entries(entries_buf: &[u8]) -> Result<Vec<DecodedEntry>> {
         let name_index = entries_buf[pos + 1];
         let value_offs =
             u16::from_le_bytes(entries_buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        let value_inum = u32::from_le_bytes(entries_buf[pos + 4..pos + 8].try_into().unwrap());
         let value_size =
             u32::from_le_bytes(entries_buf[pos + 8..pos + 12].try_into().unwrap()) as usize;
         if pos + 16 + name_len > entries_buf.len() {
             return Err(Error::Corrupt("xattr entry name overruns region"));
         }
         let name_bytes = entries_buf[pos + 16..pos + 16 + name_len].to_vec();
-        let value = if value_size == 0 {
+        let value = if value_inum != 0 || value_size == 0 {
             Vec::new()
         } else {
             if value_offs + value_size > entries_buf.len() {
@@ -399,6 +462,7 @@ fn decode_in_inode_entries(entries_buf: &[u8]) -> Result<Vec<DecodedEntry>> {
             name_index,
             name_bytes,
             value,
+            value_inum,
         });
         pos += (16 + name_len + 3) & !3;
     }
@@ -493,12 +557,13 @@ fn decode_external_block_entries(block: &[u8]) -> Result<Vec<DecodedEntry>> {
         let name_len = block[pos] as usize;
         let name_index = block[pos + 1];
         let value_offs = u16::from_le_bytes(block[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        let value_inum = u32::from_le_bytes(block[pos + 4..pos + 8].try_into().unwrap());
         let value_size = u32::from_le_bytes(block[pos + 8..pos + 12].try_into().unwrap()) as usize;
         if pos + 16 + name_len > block.len() {
             return Err(Error::Corrupt("xattr entry name overruns block"));
         }
         let name_bytes = block[pos + 16..pos + 16 + name_len].to_vec();
-        let value = if value_size == 0 {
+        let value = if value_inum != 0 || value_size == 0 {
             Vec::new()
         } else {
             if value_offs + value_size > block.len() {
@@ -510,6 +575,7 @@ fn decode_external_block_entries(block: &[u8]) -> Result<Vec<DecodedEntry>> {
             name_index,
             name_bytes,
             value,
+            value_inum,
         });
         pos += (16 + name_len + 3) & !3;
     }
@@ -655,6 +721,7 @@ pub fn plan_set_in_external_block(
     } else {
         Vec::new()
     };
+    refuse_if_any_ea_inode_backed(&entries)?;
 
     let mut outcome = SetOutcome::Inserted;
     let suffix_bytes = suffix.as_bytes();
@@ -670,6 +737,7 @@ pub fn plan_set_in_external_block(
             name_index,
             name_bytes: suffix_bytes.to_vec(),
             value: value.to_vec(),
+            value_inum: 0,
         });
     }
 
@@ -716,6 +784,7 @@ pub fn plan_remove_from_external_block(
     }
 
     let entries = decode_external_block_entries(block)?;
+    refuse_if_any_ea_inode_backed(&entries)?;
     let before = entries.len();
     let kept: Vec<DecodedEntry> = entries
         .into_iter()
@@ -742,6 +811,71 @@ pub fn get(
 ) -> Result<Option<Vec<u8>>> {
     let all = read_all(dev, inode, inode_raw, inode_size, block_size)?;
     Ok(all.into_iter().find(|e| e.name == name).map(|e| e.value))
+}
+
+/// Every xattr on `inode`, with EA-inode values followed.
+///
+/// # WHY THIS EXISTS ALONGSIDE [`read_all`]
+///
+/// `INCOMPAT_EA_INODE` means an attribute whose value is too large for the
+/// xattr area does not store its value there at all: `e_value_inum` names
+/// an inode whose file body **is** the value, and `e_value_offs` stops
+/// describing anything. Following that pointer needs to read another
+/// inode, so it needs a [`Filesystem`] — which the buffer-level parsers
+/// deliberately do not take, since they are also used on a region held in
+/// memory during a rewrite.
+///
+/// So [`read_all`] reports the pointer and leaves the value empty, and
+/// this resolves it. A caller that uses [`read_all`] directly and reads
+/// `value` without checking `value_inum` gets an empty value rather than
+/// the wrong one — the failure is visible instead of plausible, which is
+/// the whole point.
+pub fn read_all_resolved(
+    fs: &Filesystem,
+    inode: &Inode,
+    inode_raw: &[u8],
+) -> Result<Vec<XattrEntry>> {
+    let mut entries = read_all(
+        fs.dev.as_ref(),
+        inode,
+        inode_raw,
+        fs.sb.inode_size,
+        fs.sb.block_size(),
+    )?;
+    for e in entries.iter_mut() {
+        if e.value_inum != 0 {
+            e.value = crate::ea_inode::read_value_inode(fs, e.value_inum)?;
+        }
+    }
+    Ok(entries)
+}
+
+/// One xattr by fully-qualified name, with an EA-inode value followed.
+/// See [`read_all_resolved`].
+pub fn get_resolved(
+    fs: &Filesystem,
+    inode: &Inode,
+    inode_raw: &[u8],
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some(entry) = read_all(
+        fs.dev.as_ref(),
+        inode,
+        inode_raw,
+        fs.sb.inode_size,
+        fs.sb.block_size(),
+    )?
+    .into_iter()
+    .find(|e| e.name == name) else {
+        return Ok(None);
+    };
+    if entry.value_inum != 0 {
+        return Ok(Some(crate::ea_inode::read_value_inode(
+            fs,
+            entry.value_inum,
+        )?));
+    }
+    Ok(Some(entry.value))
 }
 
 #[cfg(test)]
@@ -781,11 +915,13 @@ mod tests {
                 name_index: 1,
                 name_bytes: b"color".to_vec(),
                 value: b"red".to_vec(),
+                value_inum: 0,
             },
             DecodedEntry {
                 name_index: 1,
                 name_bytes: b"mood".to_vec(),
                 value: b"happy".to_vec(),
+                value_inum: 0,
             },
         ];
         encode_in_inode_entries(&mut region, &entries);
@@ -810,6 +946,7 @@ mod tests {
             name_index: 1,
             name_bytes: b"color".to_vec(),
             value: b"red".to_vec(),
+            value_inum: 0,
         }];
         encode_in_inode_entries(&mut region, &entries);
         let outcome = plan_remove_in_inode_region(&mut region, "user.mood").unwrap();

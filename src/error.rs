@@ -52,6 +52,13 @@ pub enum Error {
     CorruptDirEntry(&'static str),
     /// Generic spec-violation error.
     Corrupt(&'static str),
+
+    /// A structure this driver can read but cannot correctly modify.
+    /// Distinct from [`Error::ReadOnly`], which is about the mount, and
+    /// from the `Unsupported*` feature errors, which are about the volume:
+    /// this is one operation on one object being refused because doing it
+    /// would leave the filesystem worse than not doing it.
+    Unsupported(&'static str),
 }
 
 impl From<io::Error> for Error {
@@ -89,6 +96,7 @@ impl std::fmt::Display for Error {
             Error::CorruptExtentTree(msg) => write!(f, "corrupt extent tree: {msg}"),
             Error::CorruptDirEntry(msg) => write!(f, "corrupt directory entry: {msg}"),
             Error::Corrupt(msg) => write!(f, "corrupt: {msg}"),
+            Error::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }
@@ -120,7 +128,9 @@ impl Error {
             | Error::CorruptExtentTree(_)
             | Error::CorruptDirEntry(_)
             | Error::Corrupt(_) => EIO,
-            Error::UnsupportedIncompat(_) | Error::UnsupportedRoCompat(_) => ENOTSUP,
+            Error::UnsupportedIncompat(_)
+            | Error::UnsupportedRoCompat(_)
+            | Error::Unsupported(_) => ENOTSUP,
         }
     }
 }
