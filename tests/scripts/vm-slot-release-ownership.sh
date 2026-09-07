@@ -149,6 +149,41 @@ else
     fails=$((fails + 1))
 fi
 
+# 10. A LINE THAT IS NOT A RECORD MUST NOT READ AS ONE.
+#
+#     `cut -f` returns the whole line for every field index when the
+#     delimiter is absent, so `read_holder` parsed a holder file reading
+#     `123` as dir=123, repo=123, since=123 — a valid record naming a
+#     directory called `123`, dated 1970. The grace that case 6 asserts
+#     was skipped for exactly the same reason as before it was fixed,
+#     just through a different door.
+#
+#     Asserted the same way as case 6, because the observable
+#     consequence is the same one: a waiter must not take the slot from
+#     a holder that completes its record within the grace.
+for bad in '123' '/d\tr\t1\tt\textra'; do
+    set_lock
+    printf "$bad\n" > "$LOCK/holder"
+    (
+        sleep 0.3
+        printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(date +%s)" > "$LOCK/holder"
+    ) &
+    completer=$!
+    if AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+        printf 'FAIL  a waiter took the slot after reading %s as a record\n' "$bad"
+        fails=$((fails + 1))
+    else
+        printf 'ok    a holder file of %s is not mistaken for a record\n' "$bad"
+    fi
+    wait "$completer" 2>/dev/null || true
+done
+
+# 11. And a well-formed record is still read, so 10 cannot be satisfied
+#     by rejecting everything — which would strand the slot for ever.
+set_lock "$OTHER"
+release
+check_lock survived "a well-formed record is still read as one"
+
 if [ "$fails" -eq 0 ]; then
     echo "PASS  vm slot release ownership"
 else
