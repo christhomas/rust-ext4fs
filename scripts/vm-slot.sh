@@ -120,11 +120,14 @@ read_holder() {
     # that is not there, which is what a caller asking for a field a
     # record does not have should get.
     fields="$(printf '%s\n' "$line" | awk -F'\t' '{print NF}')"
-    # Exactly three, which is what this script writes. A fourth field
-    # arrives with the generation token, and that widening belongs in
-    # the change that starts writing one — a forward-compatible
-    # allowance with no writer behind it is invisible until it is wrong.
-    [ "$fields" -eq 3 ] || return 1
+    # Three or four. THIS is the change that starts writing a fourth
+    # field — the generation token below — so this is where the bound
+    # widens; until now it was exactly three, because an allowance with
+    # no writer behind it is invisible until it is wrong. Three is still
+    # accepted so a lock written by the previous version stays readable
+    # rather than stranding the slot across an upgrade. Five or more is
+    # not something this script writes.
+    [ "$fields" -ge 3 ] && [ "$fields" -le 4 ] || return 1
 
     dir="$(printf '%s\n' "$line" | awk -F'\t' '{print $1}')"
     repo="$(printf '%s\n' "$line" | awk -F'\t' '{print $2}')"
@@ -148,6 +151,14 @@ read_holder() {
 # count later makes this unsafe again with nothing pointing at it.
 # `awk -F'\t'` is correct whatever `read_holder` does.
 holder_field() { read_holder | awk -F'\t' -v n="$1" '{print $n}'; }
+
+# The same accessor for a record that is not at `$HOLDER` — a lock that
+# has been moved aside for deletion. `awk` here rather than `cut` for the
+# reason above: `cut`'s answer on a record with no tab is the whole line,
+# and relying on that to be "wrong in the safe direction" is not a reason
+# to keep it. Nothing reaches this with a malformed record anyway, since
+# `holder_field 1` is read through the validating `read_holder` first.
+record_field() { awk -F'\t' -v n="$2" '{print $n}' < "$1" 2>/dev/null; }
 
 pretty_age() {
     local secs=$1
@@ -191,10 +202,44 @@ holder_is_dead() {
     return 0
 }
 
+# A BREAK DELETES THE GENERATION IT WAS AUTHORISED AGAINST, OR NOTHING.
+#
+# `$LOCK` is a fixed path, and this used to be `rm -rf "$LOCK"`. Between
+# a waiter deciding a holder was stale — a decision that involves reading
+# the record, a `ps`, and sometimes a `sleep` — and the `rm` running, the
+# lock it examined can be gone and a different, LIVE lock can occupy the
+# same path. Two waiters agreeing that one holder is stale then produced:
+# the first breaks and acquires, the second's `rm -rf` deletes the
+# first's lock, and both boot a VM.
+#
+# Adding a condition does not fix that, because no condition was missing:
+# what was missing is the binding between the check and the action. So
+# the caller passes the token it saw, this re-reads the token as late as
+# possible, and refuses if it has changed.
+#
+# The deletion then goes through a rename into a path only this process
+# knows. `rename(2)` is atomic, so exactly one of several waiters can
+# succeed in taking a given generation away, and the `rm -rf` that
+# follows targets a private directory rather than the shared path. The
+# loser's `mv` fails, it returns non-zero, and the wait loop tries again
+# — where `mkdir`'s own atomicity decides who acquires.
+#
+# Residual window, stated rather than glossed: between the token check
+# and the `mv` a lock can still be replaced, so a live holder's record
+# could be moved aside. It is two statements wide instead of a whole
+# decision wide, and the `mkdir` below still admits only one acquirer, so
+# the outcome is a lock that has to be re-taken rather than two VMs.
+# Closing it entirely needs a compare-and-swap the shell does not have.
 break_lock() {
-    local why="$1"
+    local why="$1" token="${2-}" staged
+    if [ "$(holder_field 4 2>/dev/null || true)" != "$token" ]; then
+        return 1
+    fi
+    staged="${LOCK}.breaking.$$"
+    rm -rf "$staged"
+    mv "$LOCK" "$staged" 2>/dev/null || return 1
     echo "[vm-slot] breaking the lock: $why" >&2
-    rm -rf "$LOCK"
+    rm -rf "$staged"
 }
 
 cmd_acquire() {
@@ -206,7 +251,11 @@ cmd_acquire() {
         # and the other loops -- which is the whole reason the lock is a
         # directory rather than a file somebody has to check-then-write.
         if mkdir "$LOCK" 2>/dev/null; then
-            printf '%s\t%s\t%s\n' "$VAGRANT_DIR" "$REPO_NAME" "$(now)" > "$HOLDER"
+            # The fourth field is this generation's identity. `mkdir`
+            # makes the directory unique; this makes the RECORD unique,
+            # which is what a breaker compares against.
+            printf '%s\t%s\t%s\t%s\n' "$VAGRANT_DIR" "$REPO_NAME" "$(now)" \
+                "$(now)-$$-${RANDOM}" > "$HOLDER"
             [ "$announced" = 1 ] && echo "[vm-slot] got the slot after $(pretty_age $waited)" >&2
             return 0
         fi
@@ -217,15 +266,19 @@ cmd_acquire() {
             # between the two steps. Give it a moment in case it is
             # simply mid-write, then take it.
             sleep 1
-            read_holder >/dev/null 2>&1 || { break_lock "no holder recorded"; continue; }
+            read_holder >/dev/null 2>&1 || { break_lock "no holder recorded" ""; continue; }
         fi
 
-        local since age
+        local since age token
         since="$(holder_field 3)"
+        # Read once, here, and carry it to the break: the point is that
+        # the decision and the deletion talk about the same generation.
+        token="$(holder_field 4 2>/dev/null || true)"
         age=$(( $(now) - ${since:-0} ))
 
         if [ "$age" -gt "$BOOT_GRACE_SECS" ] && holder_is_dead; then
-            break_lock "no VM is running for $(holder_field 2) after $(pretty_age $age)"
+            break_lock "no VM is running for $(holder_field 2) after $(pretty_age $age)" \
+                "$token"
             continue
         fi
         # THERE IS NO AGE-ALONE BREAK, AND THERE MUST NOT BE.
@@ -303,7 +356,35 @@ cmd_release() {
         # a VM it never booted is ordinary rather than an error.
         return 0
     fi
-    rm -rf "$LOCK"
+    # THE SAME BINDING AS `break_lock`, FOR THE SAME REASON. This
+    # validated `holder_field 1` and then, as a separate operation, ran
+    # `rm -rf "$LOCK"`. A release that checks the old holder and deletes
+    # its replacement is the identical defect on the release path — and
+    # `vm.sh down` calls this unconditionally, so it runs far more often
+    # than a break does.
+    #
+    # THE CHECK IS AFTER THE MOVE HERE AND BEFORE IT IN `break_lock`, AND
+    # THAT ASYMMETRY IS DELIBERATE. `break_lock` refuses early because it
+    # is acting on somebody else's lock and should not disturb it at all
+    # unless it is the one it decided about. `cmd_release` is acting on
+    # what it believes is its OWN lock, so it can afford to take the lock
+    # out of circulation first and check afterwards: the move is atomic,
+    # so no third party can acquire while the question is being asked,
+    # and the answer decides whether to delete it or hand it straight
+    # back. Checking before the move here would leave the same window the
+    # binding exists to close.
+    local token staged
+    token="$(holder_field 4 2>/dev/null || true)"
+    staged="${LOCK}.releasing.$$"
+    rm -rf "$staged"
+    mv "$LOCK" "$staged" 2>/dev/null || return 0
+    if [ "$(record_field "$staged/holder" 4)" != "$token" ]; then
+        # Somebody replaced the lock between the check and the move. Put
+        # it back rather than delete a slot we do not hold.
+        mv "$staged" "$LOCK" 2>/dev/null || rm -rf "$staged"
+        return 0
+    fi
+    rm -rf "$staged"
 }
 
 cmd_status() {
@@ -323,6 +404,17 @@ cmd_status() {
     fi
     return 0
 }
+
+# SOURCEABLE, SO THE FUNCTIONS CAN BE TESTED DIRECTLY.
+#
+# `break_lock`'s whole job is to refuse a deletion authorised against a
+# generation that has since been replaced, and that window is a few
+# microseconds wide when driven through the CLI — it cannot be reached
+# from outside the process. With `AM_VM_SLOT_LIB` set, this file defines
+# its functions and stops, so a test can hold one generation's token,
+# let the lock be replaced, and present the stale token to the real
+# function rather than to a reimplementation of it.
+[ -n "${AM_VM_SLOT_LIB:-}" ] && return 0
 
 case "${1:-}" in
     acquire) cmd_acquire ;;
