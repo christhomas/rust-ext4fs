@@ -463,11 +463,17 @@ impl Filesystem {
     /// Phase 6.1 — walk the orphan inode chain rooted at `s_last_orphan`
     /// and return its members in chain order.
     ///
-    /// Each orphan inode is a unlink-while-open candidate: its data
-    /// blocks should be reclaimed by recovery. The chain is encoded by
-    /// overloading `i_dtime` as "next orphan inode number"; the chain
-    /// terminates when `dtime == 0`. We cap at `inodes_count` to avoid
-    /// runaway loops on cycle-corrupted images.
+    /// The chain has TWO kinds of member, and they are not distinguished
+    /// here — see [`Filesystem::recover_orphans`], which branches on
+    /// `i_links_count` the way `ext4_orphan_cleanup` does. An inode with
+    /// no links is an unlink-while-open: its blocks and its inode should
+    /// be reclaimed. An inode that still has links is a `truncate()` a
+    /// crash interrupted: it is still named by its directory entries and
+    /// only the blocks past `i_size` should go.
+    ///
+    /// The chain is encoded by overloading `i_dtime` as "next orphan
+    /// inode number"; the chain terminates when `dtime == 0`. We cap at
+    /// `inodes_count` to avoid runaway loops on cycle-corrupted images.
     ///
     /// Read-only (no recovery yet — that's Phase 6.2). Returns `Ok([])`
     /// when there are no orphans.
@@ -496,15 +502,37 @@ impl Filesystem {
         Ok(out)
     }
 
-    /// Phase 6.2 — orphan replay. For each inode on the
-    /// `s_last_orphan` chain, free its data blocks + inode-bitmap slot,
-    /// zero its inode body (with `i_dtime = now`), and clear
-    /// `s_last_orphan`. Runs as ONE multi-block journaled transaction
-    /// so a crash mid-recovery either commits all the frees or none of
-    /// them.
+    /// Phase 6.2 — orphan replay.
     ///
-    /// Returns the number of orphan inodes reclaimed. No-op (returns 0)
-    /// when the chain is empty or the device is read-only.
+    /// # THE CHAIN HAS TWO KINDS OF MEMBER AND THEY GET OPPOSITE
+    /// TREATMENT
+    ///
+    /// The kernel branches on `i_links_count` in `ext4_orphan_cleanup`,
+    /// and so does this:
+    ///
+    /// - **No links** — an unlink-while-open. Nothing names it any more,
+    ///   so its data blocks and its inode-bitmap slot are freed and its
+    ///   body is zeroed with `i_dtime = now`.
+    /// - **Links remaining** — a `truncate()` that a crash interrupted.
+    ///   `i_size` was already lowered before the machine went down; the
+    ///   blocks past it were not yet freed. The file is still named by
+    ///   its directory entries, so recovery FINISHES THE TRUNCATE and
+    ///   leaves the file in place: free what lies past `i_size`, rewrite
+    ///   the extent root and `i_blocks`, clear `i_dtime`, and touch
+    ///   nothing else.
+    ///
+    /// Treating the second kind as the first is what this used to do,
+    /// and it destroyed data: the inode of a file the user never deleted
+    /// was freed and its body — including the block pointers that were
+    /// the only way back to its contents — zeroed, while the directory
+    /// entries naming it were left pointing at a free inode.
+    ///
+    /// Runs as ONE multi-block journaled transaction so a crash
+    /// mid-recovery either commits all of it or none of it.
+    ///
+    /// Returns the number of orphan inodes **reclaimed** — completed
+    /// truncates are not counted, because nothing was reclaimed. No-op
+    /// (returns 0) when the chain is empty or the device is read-only.
     ///
     /// Designed to be called from the mount path AFTER journal replay,
     /// so the orphans we're about to reclaim are guaranteed not still in
@@ -538,6 +566,16 @@ impl Filesystem {
                 Ok(i) => i,
                 Err(_) => continue, // unparseable orphan — skip + leak rather than panic
             };
+
+            // STILL NAMED BY A DIRECTORY. This is an interrupted
+            // truncate, not a deletion. Finish the truncate and leave
+            // the file alone.
+            if parsed.links_count != 0 {
+                total_freed_blocks +=
+                    self.buffer_finish_interrupted_truncate(&mut buf, orphan_ino, &parsed, raw)?;
+                continue;
+            }
+
             // Free data blocks (extents path only — orphan recovery for
             // legacy indirect inodes is a follow-up).
             if parsed.has_extents() && parsed.size > 0 {
@@ -587,6 +625,88 @@ impl Filesystem {
 
         self.commit_block_buffer(buf)?;
         Ok(reclaimed)
+    }
+
+    /// Finish a `truncate()` that a crash interrupted, for an orphan that
+    /// still has directory links.
+    ///
+    /// `i_size` was lowered before the machine went down and is therefore
+    /// already the size the user asked for; what is left over is the
+    /// blocks past it. So this frees exactly those, rewrites the extent
+    /// root and `i_blocks` to match, and clears `i_dtime` — which was
+    /// doing double duty as the orphan chain's "next" pointer, and which
+    /// a live file must not carry, because a non-zero `i_dtime` is how
+    /// every other tool reads "this inode was deleted".
+    ///
+    /// Returns the number of blocks freed, to be added to the
+    /// superblock's free count by the caller's single transaction.
+    ///
+    /// # WHEN THE TRUNCATE CANNOT BE PLANNED, THE FILE IS STILL LEFT
+    /// INTACT
+    ///
+    /// Two shapes cannot be planned today: an inode mapping its blocks
+    /// the legacy indirect way (every ext2 and ext3 file), and an extent
+    /// tree deeper than its inline root. Neither is a reason to delete
+    /// the file. In both cases the block freeing is skipped and only
+    /// `i_dtime` is cleared, so the inode leaves the orphan list with its
+    /// data intact and its blocks past EOF still allocated.
+    ///
+    /// That leak is visible: `e2fsck` reports the `i_blocks` it can see
+    /// against the `i_size` the inode declares. A silent deletion is not
+    /// visible to anyone until the user goes looking for the file.
+    fn buffer_finish_interrupted_truncate(
+        &self,
+        buf: &mut BlockBuffer,
+        ino: u32,
+        parsed: &Inode,
+        mut raw: Vec<u8>,
+    ) -> Result<u64> {
+        let bs = self.sb.block_size() as u64;
+        let mut freed_blocks: u64 = 0;
+        let mut freed_sectors: u64 = 0;
+
+        if parsed.has_extents() {
+            // old == new: `plan_truncate_shrink` works from the logical
+            // end that `new_size` implies, so passing i_size for both
+            // frees precisely what lies past the file's declared end.
+            // A tree this driver cannot plan leaves the blocks where they
+            // are and keeps the file — see the note above.
+            if let Ok((_sc, muts)) = crate::file_mut::plan_truncate_shrink(
+                parsed.size,
+                parsed.size,
+                &parsed.block,
+                self.sb.block_size(),
+            ) {
+                for m in &muts {
+                    match m {
+                        crate::extent_mut::ExtentMutation::WriteRoot { bytes } => {
+                            Self::patch_inode_block_area(&mut raw, bytes)?;
+                        }
+                        crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } => {
+                            freed_blocks +=
+                                self.buffer_free_block_run_and_bgd(buf, *start, *len as u64)?;
+                            freed_sectors += (*len as u64) * (bs / 512);
+                        }
+                        _ => {
+                            return Err(Error::Corrupt(
+                                "orphan truncate: unexpected mutation type",
+                            ));
+                        }
+                    }
+                }
+                let new_blocks = parsed.blocks.saturating_sub(freed_sectors);
+                Self::patch_inode_size_and_blocks(&mut raw, parsed.size, new_blocks)?;
+            }
+        }
+
+        // Off the chain, and no longer looking deleted. This happens on
+        // every path through here, including the ones that freed nothing,
+        // because an inode with links and a non-zero `i_dtime` is a
+        // contradiction that outlives the mount.
+        raw[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
+        self.finalize_inode_raw(ino, parsed.generation, &mut raw)?;
+        self.buffer_write_inode(buf, ino, &raw)?;
+        Ok(freed_blocks)
     }
 
     /// Read a whole block by its logical block number. Routes through
@@ -5197,5 +5317,207 @@ mod tests {
         let g1 = alloc_inode_generation();
         let g2 = alloc_inode_generation();
         assert_ne!(g1, g2, "successive calls must produce distinct values");
+    }
+
+    // ---------------------------------------------------------------
+    // Orphan recovery: the two kinds of orphan
+    // ---------------------------------------------------------------
+    //
+    // The kernel puts an inode on the `s_last_orphan` chain for two
+    // different reasons, and `ext4_orphan_cleanup` branches on
+    // `i_links_count` to tell them apart. Zero means unlinked-while-open:
+    // really delete it. Non-zero means a `truncate()` that a crash
+    // interrupted: the file is still named by its directory entries, and
+    // recovery is supposed to finish the truncate and leave it in place.
+    //
+    // These tests build both shapes on a formatted in-memory volume and
+    // pin the two outcomes against each other.
+
+    struct MemDev {
+        bytes: std::sync::Mutex<Vec<u8>>,
+        size: u64,
+    }
+
+    impl MemDev {
+        fn new(size: u64) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                bytes: std::sync::Mutex::new(vec![0u8; size as usize]),
+                size,
+            })
+        }
+    }
+
+    impl crate::block_io::BlockDevice for MemDev {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let b = self.bytes.lock().unwrap();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > b.len() {
+                return Err(Error::Corrupt("MemDev: read past end"));
+            }
+            buf.copy_from_slice(&b[start..end]);
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            self.size
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            let mut b = self.bytes.lock().unwrap();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > b.len() {
+                return Err(Error::Corrupt("MemDev: write past end"));
+            }
+            b[start..end].copy_from_slice(buf);
+            Ok(())
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_writable(&self) -> bool {
+            true
+        }
+    }
+
+    const BS: u32 = 4096;
+    const VOL: u64 = 32 * 1024 * 1024;
+
+    fn formatted() -> std::sync::Arc<MemDev> {
+        let dev = MemDev::new(VOL);
+        crate::mkfs::format_filesystem(dev.as_ref(), Some("orphan"), None, VOL, BS)
+            .expect("format");
+        dev
+    }
+
+    fn mount(dev: &std::sync::Arc<MemDev>) -> Filesystem {
+        Filesystem::mount(dev.clone()).expect("mount")
+    }
+
+    fn resolve(fs: &Filesystem, path: &str) -> Result<u32> {
+        let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
+        crate::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, path)
+    }
+
+    /// Put `ino` on the orphan chain with the given link count and size.
+    ///
+    /// `links == 0` is the unlinked-while-open shape. A non-zero `links`
+    /// with a lowered `size` is the shape a crash during `truncate()`
+    /// leaves: `i_size` already reduced, the extents still covering the
+    /// old range, the inode still named by its directory entries.
+    fn plant_orphan(fs: &Filesystem, ino: u32, links: u16, new_size: Option<u64>) {
+        let mut buf = BlockBuffer::new(fs.sb.block_size());
+        let (inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
+        if let Some(size) = new_size {
+            Filesystem::patch_inode_size_and_blocks(&mut raw, size, inode.blocks)
+                .expect("patch size");
+        }
+        raw[0x1A..0x1C].copy_from_slice(&links.to_le_bytes());
+        // dtime doubles as the "next orphan" link; zero terminates.
+        raw[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
+        fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+            .expect("finalize");
+        fs.buffer_write_inode(&mut buf, ino, &raw)
+            .expect("write inode");
+        fs.buffer_patch_sb_last_orphan(&mut buf, ino)
+            .expect("patch s_last_orphan");
+        fs.commit_block_buffer(buf).expect("commit");
+    }
+
+    /// The case this crate already handled: nothing names the inode any
+    /// more, so recovery really does delete it. Kept as the other half of
+    /// the pair, so the fix for the truncate case cannot be a blanket
+    /// "leave every orphan alone".
+    #[test]
+    fn an_orphan_with_no_links_is_still_reclaimed() {
+        let dev = formatted();
+        let ino = {
+            let fs = mount(&dev);
+            let ino = fs.apply_create("/gone.txt", 0o644).expect("create");
+            fs.apply_pwrite("/gone.txt", 0, &[0xAB; 4 * BS as usize])
+                .expect("write");
+            ino
+        };
+        {
+            let fs = mount(&dev);
+            plant_orphan(&fs, ino, 0, None);
+        }
+        // Recovery runs on this mount; the next one observes the result.
+        drop(mount(&dev));
+
+        let fs = mount(&dev);
+        assert!(
+            fs.orphan_list().expect("orphan_list").is_empty(),
+            "recovery must empty the chain"
+        );
+        let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+        assert_eq!(inode.links_count, 0, "an unlinked orphan stays unlinked");
+        assert_ne!(inode.dtime, 0, "and is stamped as deleted");
+        assert_eq!(inode.size, 0, "its body is gone");
+    }
+
+    /// THE CASE THAT DESTROYED DATA. An inode on the orphan chain with a
+    /// non-zero link count is a `truncate()` a crash interrupted. It is
+    /// still named by its directory entries. Recovery must finish the
+    /// truncate, not delete the file.
+    #[test]
+    fn an_orphan_that_still_has_links_is_truncated_not_deleted() {
+        let dev = formatted();
+        let payload: Vec<u8> = (0..4 * BS as usize).map(|i| (i % 251) as u8).collect();
+
+        let ino = {
+            let fs = mount(&dev);
+            let ino = fs.apply_create("/keep.txt", 0o644).expect("create");
+            fs.apply_pwrite("/keep.txt", 0, &payload).expect("write");
+            fs.apply_link("/keep.txt", "/also-keep.txt").expect("link");
+            ino
+        };
+
+        let before_free = {
+            let fs = mount(&dev);
+            // i_size drops to one block; the four blocks of extents stay.
+            plant_orphan(&fs, ino, 2, Some(BS as u64));
+            fs.sb.free_blocks_count
+        };
+
+        // Recovery runs on this mount; the next one observes the result.
+        drop(mount(&dev));
+
+        let fs = mount(&dev);
+        assert!(
+            fs.orphan_list().expect("orphan_list").is_empty(),
+            "recovery must empty the chain"
+        );
+
+        let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+        assert_eq!(
+            inode.links_count, 2,
+            "the file is named twice and was never unlinked; recovery deleted it"
+        );
+        assert_eq!(inode.dtime, 0, "a live file must not be stamped as deleted");
+        assert_eq!(
+            inode.size, BS as u64,
+            "the interrupted truncate should be finished, not undone"
+        );
+
+        assert_eq!(resolve(&fs, "/keep.txt").expect("keep.txt"), ino);
+        assert_eq!(resolve(&fs, "/also-keep.txt").expect("also-keep.txt"), ino);
+
+        let data = crate::file_io::read_all(&fs, &inode).expect("read back");
+        assert_eq!(
+            data.len(),
+            BS as usize,
+            "the surviving file is its first i_size bytes"
+        );
+        assert_eq!(
+            &data[..],
+            &payload[..BS as usize],
+            "and those bytes are the ones that were written"
+        );
+
+        assert_eq!(
+            fs.sb.free_blocks_count,
+            before_free + 3,
+            "only the three blocks past the new EOF should have been freed"
+        );
     }
 }
