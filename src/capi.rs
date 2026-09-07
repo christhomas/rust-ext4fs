@@ -1346,13 +1346,7 @@ pub unsafe extern "C" fn fs_ext4_listxattr(
                 }
             };
 
-            let entries = match xattr::read_all(
-                fs_ref.dev.as_ref(),
-                &inode,
-                &inode_raw,
-                fs_ref.sb.inode_size,
-                fs_ref.sb.block_size(),
-            ) {
+            let entries = match xattr::read_all_resolved(fs_ref, &inode, &inode_raw) {
                 Ok(v) => v,
                 Err(e) => {
                     set_err_from(&e, &format!("listxattr {path_str}"));
@@ -1419,14 +1413,7 @@ pub unsafe extern "C" fn fs_ext4_getxattr(
                 }
             };
 
-            let value = match xattr::get(
-                fs_ref.dev.as_ref(),
-                &inode,
-                &inode_raw,
-                fs_ref.sb.inode_size,
-                fs_ref.sb.block_size(),
-                name_str,
-            ) {
+            let value = match xattr::get_resolved(fs_ref, &inode, &inode_raw, name_str) {
                 Ok(Some(v)) => v,
                 Ok(None) => {
                     set_err_msg(

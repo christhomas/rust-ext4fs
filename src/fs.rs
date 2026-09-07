@@ -5569,6 +5569,218 @@ mod tests {
         fs.apply_create("/after.txt", 0o644).expect("create");
     }
 
+    // ---------------------------------------------------------------
+    // EA_INODE: an attribute whose value lives in another inode
+    // ---------------------------------------------------------------
+
+    /// Give `ino` an in-inode xattr named `name` whose `e_value_inum`
+    /// points at `value_inum`, while the bytes at `e_value_offs` are
+    /// `decoy` — which is the shape that makes the defect quiet. The
+    /// decoy is a real, in-range value, so a parser that ignores
+    /// `e_value_inum` returns plausible bytes rather than failing.
+    fn plant_ea_inode_xattr(fs: &Filesystem, ino: u32, name: &str, value_inum: u32, decoy: &[u8]) {
+        let (inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
+        let inode_size = fs.sb.inode_size as usize;
+        let extra_isize = u16::from_le_bytes(raw[128..130].try_into().unwrap()) as usize;
+        let start = 128 + extra_isize;
+        {
+            let region = &mut raw[start..inode_size];
+            crate::xattr::plan_set_in_inode_region(region, name, decoy).expect("set xattr");
+            // The entry table begins after the 4-byte magic; this is the
+            // only entry, so it is the first one. Point it at the EA
+            // inode and leave `e_value_offs` and `e_value_size` alone, so
+            // the decoy stays exactly where a careless read would find it.
+            let e = 4;
+            region[e + 4..e + 8].copy_from_slice(&value_inum.to_le_bytes());
+        }
+        let mut buf = BlockBuffer::new(fs.sb.block_size());
+        fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+            .expect("finalize");
+        fs.buffer_write_inode(&mut buf, ino, &raw).expect("write");
+        fs.commit_block_buffer(buf).expect("commit");
+    }
+
+    /// Turn an ordinary file into an EA inode: set the flag its own
+    /// reader checks for, and leave its body as the attribute's value.
+    fn mark_as_ea_inode(fs: &Filesystem, ino: u32) {
+        let (inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
+        let flags = u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap());
+        let flags = flags | crate::inode::InodeFlags::EA_INODE.bits();
+        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+        let mut buf = BlockBuffer::new(fs.sb.block_size());
+        fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+            .expect("finalize");
+        fs.buffer_write_inode(&mut buf, ino, &raw).expect("write");
+        fs.commit_block_buffer(buf).expect("commit");
+    }
+
+    const DECOY: [u8; 64] = [0xEE; 64];
+
+    fn ea_inode_volume() -> (std::sync::Arc<MemDev>, Vec<u8>) {
+        let dev = formatted();
+        let real: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(7).wrapping_add(3))
+            .collect();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/subject.txt", 0o644).expect("create");
+            let ea = fs.apply_create("/value.bin", 0o644).expect("create ea");
+            fs.apply_pwrite("/value.bin", 0, &real)
+                .expect("write value");
+            mark_as_ea_inode(&fs, ea);
+            let subject = resolve(&fs, "/subject.txt").expect("resolve");
+            plant_ea_inode_xattr(&fs, subject, "user.big", ea, &DECOY);
+        }
+        (dev, real)
+    }
+
+    /// THE BYTES THE ATTRIBUTE ACTUALLY HOLDS. Both parsers read
+    /// `e_value_inum` and dropped it, then sliced the value out of the
+    /// region at `e_value_offs` — which for an EA-inode entry points at
+    /// nothing in particular, and here points at a decoy.
+    #[test]
+    fn an_ea_inode_backed_value_is_read_from_the_inode_it_names() {
+        let (dev, real) = ea_inode_volume();
+        let fs = mount(&dev);
+        let ino = resolve(&fs, "/subject.txt").expect("resolve");
+        let (inode, raw) = fs.read_inode_verified(ino).expect("read inode");
+
+        let got = crate::xattr::get_resolved(&fs, &inode, &raw, "user.big")
+            .expect("get")
+            .expect("the attribute is present");
+
+        assert_ne!(
+            got, DECOY,
+            "the value was read from e_value_offs instead of from the EA inode"
+        );
+        assert_eq!(got, real, "the value must be the EA inode's file body");
+    }
+
+    /// THE OTHER DOOR. `get_resolved` is the single-attribute entry
+    /// point and `read_all_resolved` is the list-all one, and they are
+    /// separate functions with separate resolution — `capi.rs` reaches
+    /// the first from `fs_ext4_getxattr` and the second from
+    /// `fs_ext4_listxattr`.
+    ///
+    /// A consumer enumerating attributes rather than asking for one by
+    /// name goes through the list-all path, so leaving it unresolved
+    /// hands back an empty value with a success return: the same failure
+    /// this issue is about, through a different door.
+    #[test]
+    fn the_list_all_path_resolves_an_ea_inode_value_too() {
+        let (dev, real) = ea_inode_volume();
+        let fs = mount(&dev);
+        let ino = resolve(&fs, "/subject.txt").expect("resolve");
+        let (inode, raw) = fs.read_inode_verified(ino).expect("read inode");
+
+        let entries =
+            crate::xattr::read_all_resolved(&fs, &inode, &raw).expect("read_all_resolved");
+        let e = entries
+            .iter()
+            .find(|e| e.name == "user.big")
+            .expect("the attribute is present");
+
+        assert!(
+            !e.value.is_empty(),
+            "the list-all path returned an empty value with a success return"
+        );
+        assert_ne!(
+            e.value, DECOY,
+            "the value was read from e_value_offs instead of from the EA inode"
+        );
+        assert_eq!(e.value, real, "the value must be the EA inode's file body");
+    }
+
+    /// The buffer-level parser cannot follow the pointer — it has no
+    /// filesystem — so it must report the pointer and an EMPTY value
+    /// rather than the bytes at `e_value_offs`. An empty value is a
+    /// visible failure; a decoy is a plausible one.
+    #[test]
+    fn the_buffer_level_parser_reports_the_pointer_and_no_value() {
+        let (dev, _real) = ea_inode_volume();
+        let fs = mount(&dev);
+        let ino = resolve(&fs, "/subject.txt").expect("resolve");
+        let (inode, raw) = fs.read_inode_verified(ino).expect("read inode");
+
+        let entries = crate::xattr::read_all(
+            fs.dev.as_ref(),
+            &inode,
+            &raw,
+            fs.sb.inode_size,
+            fs.sb.block_size(),
+        )
+        .expect("read_all");
+        let e = entries
+            .iter()
+            .find(|e| e.name == "user.big")
+            .expect("the attribute is present");
+
+        assert_ne!(e.value_inum, 0, "the pointer must be reported");
+        assert!(
+            e.value.is_empty(),
+            "the value must not be taken from e_value_offs; got {:?}",
+            e.value
+        );
+    }
+
+    /// THE WRITE THAT WOULD ORPHAN IT. The in-inode region is rewritten
+    /// wholesale, so touching any attribute re-emits every other one —
+    /// and an EA-inode-backed entry cannot be re-emitted, because its
+    /// value is not there to repack. Refusing is the honest answer while
+    /// following and refcounting EA inodes is unimplemented.
+    #[test]
+    fn rewriting_an_attribute_area_holding_an_ea_inode_entry_is_refused() {
+        let (dev, _real) = ea_inode_volume();
+        let fs = mount(&dev);
+        let ino = resolve(&fs, "/subject.txt").expect("resolve");
+        let (_inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
+        let inode_size = fs.sb.inode_size as usize;
+        let extra_isize = u16::from_le_bytes(raw[128..130].try_into().unwrap()) as usize;
+        let region = &mut raw[128 + extra_isize..inode_size];
+
+        let removed = crate::xattr::plan_remove_in_inode_region(region, "user.big");
+        assert!(
+            matches!(removed, Err(Error::Unsupported(_))),
+            "removing it must be refused, not silently orphan the EA inode; got {removed:?}"
+        );
+
+        let set = crate::xattr::plan_set_in_inode_region(region, "user.other", b"x");
+        assert!(
+            matches!(set, Err(Error::Unsupported(_))),
+            "setting a DIFFERENT attribute must also be refused, because the rewrite \
+             re-emits the EA-inode entry too; got {set:?}"
+        );
+    }
+
+    /// The control: an ordinary inline attribute still reads and still
+    /// rewrites, so none of the above can be satisfied by refusing
+    /// everything.
+    #[test]
+    fn an_ordinary_inline_attribute_is_unaffected() {
+        let dev = formatted();
+        let fs = mount(&dev);
+        let ino = fs.apply_create("/plain.txt", 0o644).expect("create");
+        let (inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
+        let inode_size = fs.sb.inode_size as usize;
+        let extra_isize = u16::from_le_bytes(raw[128..130].try_into().unwrap()) as usize;
+        {
+            let region = &mut raw[128 + extra_isize..inode_size];
+            crate::xattr::plan_set_in_inode_region(region, "user.small", b"hello")
+                .expect("an ordinary set must still work");
+        }
+        let mut buf = BlockBuffer::new(fs.sb.block_size());
+        fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+            .expect("finalize");
+        fs.buffer_write_inode(&mut buf, ino, &raw).expect("write");
+        fs.commit_block_buffer(buf).expect("commit");
+
+        let (inode, raw) = fs.read_inode_verified(ino).expect("re-read");
+        let got = crate::xattr::get_resolved(&fs, &inode, &raw, "user.small")
+            .expect("get")
+            .expect("present");
+        assert_eq!(got, b"hello");
+    }
+
     /// THE CASE THAT DESTROYED DATA. An inode on the orphan chain with a
     /// non-zero link count is a `truncate()` a crash interrupted. It is
     /// still named by its directory entries. Recovery must finish the
