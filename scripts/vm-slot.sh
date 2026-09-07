@@ -191,13 +191,16 @@ cmd_release() {
         rm -rf "$LOCK"
         return 0
     fi
-    if read_holder >/dev/null 2>&1; then
-        if [ "$(holder_field 1)" != "$VAGRANT_DIR" ]; then
-            # Somebody else's slot. Leave it alone, and say nothing:
-            # `down` calls this unconditionally, and a repository halting
-            # a VM it never booted is ordinary rather than an error.
-            return 0
-        fi
+    if ! read_holder >/dev/null 2>&1; then
+        # The lock exists with no holder recorded: somebody is between
+        # `mkdir` and the write. Not ours to free -- acquire reclaims it.
+        return 0
+    fi
+    if [ "$(holder_field 1)" != "$VAGRANT_DIR" ]; then
+        # Somebody else's slot. Leave it alone, and say nothing:
+        # `down` calls this unconditionally, and a repository halting
+        # a VM it never booted is ordinary rather than an error.
+        return 0
     fi
     rm -rf "$LOCK"
 }

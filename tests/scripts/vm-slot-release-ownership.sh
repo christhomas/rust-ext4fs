@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# vm-slot-release-ownership.sh — who may free the oracle slot.
+#
+# `cmd_release` is called unconditionally by `vm.sh down`, including
+# from a repository that never booted anything, so "release something I
+# do not hold" is an ordinary event rather than an exotic one. The whole
+# of the slot's value rests on that call being a no-op.
+#
+# THE EXIT CODE CARRIES NO SIGNAL. `release` returns 0 whether it freed
+# the lock or declined to, which is deliberate — a `down` that says
+# nothing is the point — and it means a test that checks the exit code
+# passes against a release that frees everything. So every assertion
+# here is on whether the lock directory is still there afterwards.
+#
+# The third case exists so that an over-correction fails. "Never release
+# anything" closes the hole in the second case and would look like extra
+# safety; it also strands the slot for ever, and only a holder releasing
+# its own slot notices.
+#
+#   bash tests/scripts/vm-slot-release-ownership.sh
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fails=0
+
+sandbox="$(mktemp -d)"
+trap 'rm -rf "$sandbox"' EXIT
+
+export AM_ORACLE_VM_STATE="$sandbox/state"
+LOCK="$AM_ORACLE_VM_STATE/slot.lock"
+
+# The directory this repository's own release call claims to hold, which
+# is how `vm-slot.sh` identifies itself.
+SELF="$REPO/tests/vagrant"
+OTHER="$sandbox/some/other/repo/tests/vagrant"
+
+release() { "$REPO/scripts/vm-slot.sh" release >/dev/null 2>&1; }
+
+# Lay down a lock; with a holder file when one is given, without when
+# not — the second being the ordinary state of `cmd_acquire` between its
+# `mkdir` and the `printf` that records who took it.
+set_lock() {
+    rm -rf "$LOCK"
+    mkdir -p "$LOCK"
+    if [ "$#" -gt 0 ]; then
+        printf '%s\t%s\t%s\n' "$1" "holder-repo" "$(date +%s)" > "$LOCK/holder"
+    fi
+}
+
+check_lock() {
+    local want="$1" what="$2" got
+    if [ -d "$LOCK" ]; then got=survived; else got=removed; fi
+    if [ "$got" = "$want" ]; then
+        printf 'ok    %s\n' "$what"
+    else
+        printf 'FAIL  %s: lock %s, expected %s\n' "$what" "$got" "$want"
+        fails=$((fails + 1))
+    fi
+}
+
+# 1. Somebody else holds it, and says so. The long-standing case, and
+#    the one that already worked.
+set_lock "$OTHER"
+release
+check_lock survived "a recorded holder's slot is not freed by anyone else"
+
+# 2. The lock exists and nobody has recorded a holder yet. This is not a
+#    corrupt state: it is `cmd_acquire` mid-way through taking the slot.
+#    Freeing it here hands the same slot to a second caller, and both
+#    then boot a 4 GB machine.
+set_lock
+release
+check_lock survived "a lock with no holder recorded yet is not freed by a non-holder"
+
+# 3. The holder releasing its own slot must still work, or the slot is
+#    stranded for ever and the fix for 2 is worse than the defect.
+set_lock "$SELF"
+release
+check_lock removed "the holder can still release its own slot"
+
+# 4. `--force` is the documented escape hatch for a slot nobody will
+#    give back, and 2 must not have disarmed it.
+set_lock
+"$REPO/scripts/vm-slot.sh" release --force >/dev/null 2>&1
+check_lock removed "--force still frees a lock with no holder recorded"
+
+# 5. Declining in case 2 must not strand the lock, because `acquire`
+#    reclaims that state itself: it waits a moment for a holder mid-write
+#    and then breaks the lock. Without this the fix for 2 would trade a
+#    race for a deadlock.
+set_lock
+if AM_ORACLE_VM_WAIT=20 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+    printf 'ok    acquire still reclaims a lock with no holder recorded\n'
+else
+    printf 'FAIL  acquire could not reclaim an unheld lock: the slot is stranded\n'
+    fails=$((fails + 1))
+fi
+
+if [ "$fails" -eq 0 ]; then
+    echo "PASS  vm slot release ownership"
+else
+    echo "FAIL  $fails assertion(s)" >&2
+    exit 1
+fi
