@@ -149,6 +149,44 @@ else
     fails=$((fails + 1))
 fi
 
+# 8. A LIVE VM'S SLOT SURVIVES, HOWEVER LONG IT HAS BEEN HELD.
+#
+#    `cmd_acquire` used to break any lock older than 90 minutes without
+#    asking whether a VM was still running. A fixture build routinely
+#    outlives that — `vm.sh up` and `vm-e2fsck.sh` deliberately leave
+#    the machine up between invocations — so the waiter took the slot
+#    from a live VM and booted a second 4 GB one beside it.
+#
+#    `holder_is_dead` decides liveness by looking for a qemu process
+#    whose command line names the holder's directory, so a stand-in
+#    process with that shape is enough to make the holder live. The
+#    holder's timestamp is set a day in the past, far beyond any
+#    timeout that ever existed here.
+set_lock
+printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(( $(date +%s) - 86400 ))" > "$LOCK/holder"
+( exec -a "qemu-system-stand-in -drive file=$OTHER/disk.img" sleep 30 ) &
+faux_vm=$!
+sleep 0.3
+if AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+    printf 'FAIL  a waiter took the slot from a VM that is still running\n'
+    fails=$((fails + 1))
+else
+    printf 'ok    a live VM keeps its slot however long it has held it\n'
+fi
+kill "$faux_vm" 2>/dev/null || true
+wait "$faux_vm" 2>/dev/null || true
+
+# 9. And the same lock with no VM behind it is still reclaimed, so the
+#    fix for 8 is "require liveness", not "never break anything".
+set_lock
+printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(( $(date +%s) - 86400 ))" > "$LOCK/holder"
+if AM_ORACLE_VM_WAIT=20 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+    printf 'ok    a lock whose VM is gone is still reclaimed\n'
+else
+    printf 'FAIL  a dead holder lock was not reclaimed: the slot is stranded\n'
+    fails=$((fails + 1))
+fi
+
 # 10. A LINE THAT IS NOT A RECORD MUST NOT READ AS ONE.
 #
 #     `cut -f` returns the whole line for every field index when the
