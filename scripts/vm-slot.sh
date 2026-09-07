@@ -99,12 +99,31 @@ now() { date +%s; }
 # the grace period reachable.
 read_holder() {
     [ -f "$HOLDER" ] || return 1
-    local line dir repo since
+    local line fields dir repo since
     IFS= read -r line < "$HOLDER" 2>/dev/null || return 1
     [ -n "$line" ] || return 1
-    dir="$(printf '%s' "$line" | cut -f1)"
-    repo="$(printf '%s' "$line" | cut -f2)"
-    since="$(printf '%s' "$line" | cut -f3)"
+
+    # `cut -f` DOES NOT ENFORCE THE DELIMITER. On a line containing no
+    # tab at all it returns the WHOLE LINE for every field index, so the
+    # three `cut` calls this replaces set `dir`, `repo` and `since` to
+    # the same string — and a numeric one passed every check below. A
+    # holder file reading `123` was a valid record naming a directory
+    # called `123`.
+    #
+    # Counting the fields first is what makes the split real, and `awk`
+    # is used for the split as well because it returns EMPTY for a field
+    # that is not there, which is what a caller asking for a field a
+    # record does not have should get.
+    fields="$(printf '%s\n' "$line" | awk -F'\t' '{print NF}')"
+    # Exactly three, which is what this script writes. A fourth field
+    # arrives with the generation token, and that widening belongs in
+    # the change that starts writing one — a forward-compatible
+    # allowance with no writer behind it is invisible until it is wrong.
+    [ "$fields" -eq 3 ] || return 1
+
+    dir="$(printf '%s\n' "$line" | awk -F'\t' '{print $1}')"
+    repo="$(printf '%s\n' "$line" | awk -F'\t' '{print $2}')"
+    since="$(printf '%s\n' "$line" | awk -F'\t' '{print $3}')"
     [ -n "$dir" ] && [ -n "$repo" ] || return 1
     case "$since" in
         '' | *[!0-9]*) return 1 ;;
@@ -112,7 +131,18 @@ read_holder() {
     printf '%s\n' "$line"
 }
 
-holder_field() { read_holder | cut -f"$1"; }
+# `awk` rather than `cut`, and NOT because `cut` mishandles a field past
+# the end — it does not. Measured on both implementations, `cut -f4` of a
+# three-field line is empty, same as `awk`; the whole-line behaviour is
+# POSIX's "lines with no delimiters shall be written" rule and applies
+# only to a line carrying no tab at all.
+#
+# The reason is the coupling. After the check above, `cut` here would be
+# safe only BECAUSE `read_holder` guarantees the line has tabs — a
+# silent dependency between two functions, where relaxing the field
+# count later makes this unsafe again with nothing pointing at it.
+# `awk -F'\t'` is correct whatever `read_holder` does.
+holder_field() { read_holder | awk -F'\t' -v n="$1" '{print $n}'; }
 
 pretty_age() {
     local secs=$1
