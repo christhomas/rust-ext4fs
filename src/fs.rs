@@ -355,12 +355,15 @@ impl Filesystem {
         // mount of an MMP filesystem still works, which is what a user
         // recovering data from a disk another machine has open
         // actually wants.
-        if fs.dev.is_writable()
-            && fs.sb.feature_incompat & crate::features::Incompat::MMP.bits() != 0
-        {
-            return Err(crate::error::Error::UnsupportedIncompat(
-                crate::features::Incompat::MMP.bits(),
-            ));
+        //
+        // CASEFOLD has the same shape and is refused by the same check —
+        // see `features::WRITE_BREAKING_INCOMPAT`, which is where the
+        // reasoning for each bit now lives. It is one set rather than a
+        // chain of `if`s because a second copy of this shape is how the
+        // first one gets forgotten.
+        let write_breaking = crate::features::write_breaking_incompat(fs.sb.feature_incompat);
+        if fs.dev.is_writable() && write_breaking != 0 {
+            return Err(crate::error::Error::UnsupportedIncompat(write_breaking));
         }
 
         if !defer_replay && fs.dev.is_writable() {
@@ -5453,6 +5456,117 @@ mod tests {
         assert_eq!(inode.links_count, 0, "an unlinked orphan stays unlinked");
         assert_ne!(inode.dtime, 0, "and is stamped as deleted");
         assert_eq!(inode.size, 0, "its body is gone");
+    }
+
+    // ---------------------------------------------------------------
+    // Features that may be read and may not be written
+    // ---------------------------------------------------------------
+
+    /// A device that reads and writes like `MemDev` but reports itself
+    /// read-only, so a mount takes the read-only path.
+    struct RoDev(std::sync::Arc<MemDev>);
+
+    impl crate::block_io::BlockDevice for RoDev {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.0.read_at(offset, buf)
+        }
+        fn size_bytes(&self) -> u64 {
+            self.0.size_bytes()
+        }
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<()> {
+            Err(Error::ReadOnly)
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_writable(&self) -> bool {
+            false
+        }
+    }
+
+    /// Set an INCOMPAT bit on a formatted volume, fixing the superblock
+    /// checksum so the result still mounts.
+    fn set_incompat_bit(dev: &std::sync::Arc<MemDev>, bit: u32) {
+        let mut sb = vec![0u8; 1024];
+        dev.read_at(crate::superblock::SUPERBLOCK_OFFSET, &mut sb)
+            .expect("read sb");
+        let cur = u32::from_le_bytes(sb[0x60..0x64].try_into().unwrap());
+        sb[0x60..0x64].copy_from_slice(&(cur | bit).to_le_bytes());
+        let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        dev.write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb)
+            .expect("write sb");
+    }
+
+    /// A CASEFOLD volume must not be mounted writable.
+    ///
+    /// The kernel files a directory entry into the htree leaf that the
+    /// SipHash of the case-folded name selects; this driver hashes the
+    /// raw bytes. Reads survive on the linear-scan fallback. A write does
+    /// not: the entry lands in the wrong leaf, stays findable here and
+    /// stops being findable on Linux.
+    #[test]
+    fn a_casefold_volume_is_not_mounted_writable() {
+        let dev = formatted();
+        set_incompat_bit(&dev, crate::features::Incompat::CASEFOLD.bits());
+
+        let err = match Filesystem::mount(dev.clone()) {
+            Ok(_) => panic!("a writable mount of a CASEFOLD volume must be refused"),
+            Err(e) => e,
+        };
+        match err {
+            Error::UnsupportedIncompat(bits) => assert_eq!(
+                bits,
+                crate::features::Incompat::CASEFOLD.bits(),
+                "the refusal must name the bit responsible"
+            ),
+            other => panic!("expected UnsupportedIncompat, got {other:?}"),
+        }
+    }
+
+    /// And it must still be READABLE, which is the whole reason the
+    /// refusal is scoped to writable mounts rather than to the volume.
+    #[test]
+    fn a_casefold_volume_still_mounts_read_only() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/before.txt", 0o644).expect("create");
+        }
+        set_incompat_bit(&dev, crate::features::Incompat::CASEFOLD.bits());
+
+        let ro = std::sync::Arc::new(RoDev(dev.clone()));
+        let fs = Filesystem::mount(ro).expect("a read-only mount must still work");
+        assert_eq!(
+            resolve(&fs, "/before.txt").expect("the directory is still readable"),
+            resolve(&fs, "/before.txt").expect("stable"),
+        );
+    }
+
+    /// The MMP case this generalised, so folding the two into one set
+    /// cannot have dropped the original.
+    #[test]
+    fn an_mmp_volume_is_still_not_mounted_writable() {
+        let dev = formatted();
+        set_incompat_bit(&dev, crate::features::Incompat::MMP.bits());
+        let err = match Filesystem::mount(dev.clone()) {
+            Ok(_) => panic!("a writable mount of an MMP volume must be refused"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            Error::UnsupportedIncompat(b) if b == crate::features::Incompat::MMP.bits()
+        ));
+    }
+
+    /// The control: an ordinary volume still mounts writable and still
+    /// accepts a create, so none of the above can be satisfied by
+    /// refusing every writable mount.
+    #[test]
+    fn an_ordinary_volume_still_mounts_writable() {
+        let dev = formatted();
+        let fs = Filesystem::mount(dev.clone()).expect("mount");
+        fs.apply_create("/after.txt", 0o644).expect("create");
     }
 
     /// THE CASE THAT DESTROYED DATA. An inode on the orphan chain with a
