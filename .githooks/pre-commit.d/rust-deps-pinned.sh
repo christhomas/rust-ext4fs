@@ -222,15 +222,87 @@ if [ -f Cargo.lock ] && [ -d .github/workflows ]; then
       pins=$(grep -rhoE "v[0-9]+\.[0-9]+\.[0-9]+" \
                <(grep -rhE "$sib(\.git)?([^A-Za-z0-9._-]|\$)" .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null) \
              2>/dev/null | sort -u)
-      if printf '%s\n' "$pins" | grep -qE "^v${lockver}$"; then continue; fi
-      # A *_REF indirection: resolve every REF variable and try again.
+      # A *_REF indirection: resolve every REF variable too.
       refs=$(grep -rhoE "^[[:space:]]*[A-Z0-9_]+_REF:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+" \
                .github/workflows/*.yml chores.yml 2>/dev/null | grep -oE "v[0-9]+\.[0-9]+\.[0-9]+" | sort -u)
-      if printf '%s\n' "$refs" | grep -qE "^v${lockver}$"; then continue; fi
       # Nothing pinned for this sibling at all → not this check's business.
       [ -n "$pins$refs" ] || continue
-      echo "[deps] Cargo.lock records $crate = $lockver, and no workflow pins that version." >&2
-      echo "       The workflows pin: $(printf '%s\n' $pins $refs | sort -u | tr '\n' ' ')" >&2
+
+      # EVERY PIN THAT CLONES THIS SIBLING INTO THE CONSUMER'S OWN
+      # SIBLING SLOT MUST MATCH, not merely one of them.
+      #
+      # This check used to be existential -- it passed as soon as any
+      # workflow named the lock's version. That let a repository hold two
+      # pins for the same sibling and be told it was fine: `ci.yml` at
+      # v0.2.10 satisfied the check while `release.yml` sat at v0.2.7,
+      # and since the release job only runs on a tag, the first sign was
+      # a failed publish. The guard was in place the whole time and could
+      # not have caught it, which is worse than not having it.
+      #
+      # `../<sibling>` IS THE DISCRIMINATOR, and it matters. A workflow
+      # may legitimately clone the same sibling somewhere else, at a
+      # different version, to satisfy a DIFFERENT crate's requirement --
+      # `rust-fs-ntfs` clones am-fs-core into RUNNER_TEMP at the version
+      # am-img-vhd wants, which has nothing to do with this crate's lock.
+      # Flagging that would be a false positive, and a guard that cries
+      # wolf gets bypassed.
+      #
+      # TWO SPELLINGS, and both have to be read. A `git clone --branch`
+      # puts the tag and the destination on one line, so a line filter
+      # sees it. `actions/checkout` spreads `repository:`, `ref:` and
+      # `path:` over separate lines, and a line filter sees none of
+      # them -- which is how a second repository in this constellation
+      # ran this check green with two pins it never examined.
+      bad=$(grep -rnE "$sib(\.git)?([^A-Za-z0-9._-]|\$)" \
+              .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null \
+            | grep -E "\.\./$sib([^A-Za-z0-9._-]|\$)" \
+            | grep -E "v[0-9]+\.[0-9]+\.[0-9]+" \
+            | grep -vE "v${lockver}([^0-9]|\$)")
+
+      # The `actions/checkout` form. A `repository:` naming the sibling,
+      # then within the next few lines a `ref:` giving the tag and a
+      # `path:` giving where it lands. `path` is the discriminator here,
+      # exactly as `../<sib>` is above: a checkout of the same sibling
+      # somewhere else, to satisfy some other crate, is not this lock's
+      # business.
+      for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+        [ -f "$wf" ] || continue
+        checkout_bad=$(awk -v sib="$sib" -v want="v$lockver" -v file="$wf" '
+          $0 ~ ("repository:[[:space:]]*.*/" sib "[[:space:]]*$") { inblk = 1; ln = NR; ref = ""; pth = ""; next }
+          inblk {
+            if ($0 ~ /ref:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+/) { ref = $NF }
+            if ($0 ~ /path:[[:space:]]*/) { pth = $NF }
+            if (NR - ln > 4 || ($0 ~ /^[[:space:]]*-/ && NR > ln)) {
+              if (ref != "" && ref != want && (pth == sib || pth == ".." "/" sib)) {
+                printf "%s:%d: ref: %s\n", file, ln, ref
+              }
+              inblk = 0
+            }
+          }
+          END {
+            if (inblk && ref != "" && ref != want && (pth == sib || pth == ".." "/" sib)) {
+              printf "%s:%d: ref: %s\n", file, ln, ref
+            }
+          }
+        ' "$wf")
+        [ -n "$checkout_bad" ] && bad="${bad:+$bad
+}$checkout_bad"
+      done
+      if [ -z "$bad" ]; then
+        # Every literal that clones into the sibling slot agrees. The
+        # remaining way to be pinned is through a *_REF variable.
+        if [ -n "$(printf '%s\n' "$pins" | grep -E "^v${lockver}$")" ] \
+           || [ -n "$(printf '%s\n' "$refs" | grep -E "^v${lockver}$")" ]; then
+          continue
+        fi
+      fi
+      echo "[deps] Cargo.lock records $crate = $lockver, and a workflow pins a different version." >&2
+      if [ -n "$bad" ]; then
+        echo "       These lines clone ../$sib at a version the lock does not name:" >&2
+        printf '         %s\n' "$bad" >&2
+      else
+        echo "       The workflows pin: $(printf '%s\n' $pins $refs | sort -u | tr '\n' ' ')" >&2
+      fi
       echo "       CI clones the sibling at its pinned tag and then refuses the lock:" >&2
       echo "         error: cannot update the lock file … because --locked was passed" >&2
       echo "       Fix EITHER side: move the pin to v$lockver, or restore the lock" >&2
