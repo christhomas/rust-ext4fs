@@ -97,6 +97,58 @@ else
     fails=$((fails + 1))
 fi
 
+# 6. A HOLDER MID-WRITE MUST NOT BE ROBBED.
+#
+#    `cmd_acquire` takes the slot in two steps — `mkdir`, then write the
+#    holder record — so between them the lock exists with an EMPTY
+#    holder file. The `sleep 1` in the wait loop exists to let that
+#    write land, and it is reached only when `read_holder` reports that
+#    there is no record yet.
+#
+#    `read_holder` used to succeed on an empty file, so the grace never
+#    fired: the waiter read an empty timestamp, computed an age of 56
+#    years, found field 1 empty and therefore "dead", and broke the lock
+#    of a process that was one statement from finishing.
+#
+#    This asserts the grace by using it: lay down an empty holder file,
+#    start a waiter, and complete the record while the waiter is inside
+#    its grace. The lock must still belong to the original holder.
+#    The assertion is on whether the WAITER ACQUIRED, not on the holder
+#    file's contents: the file is at a fixed path, so a waiter that
+#    breaks the lock and a holder that completes its write both end up
+#    writing it, and comparing its contents cannot tell them apart. The
+#    exit status of `acquire` can — it is 0 only if the waiter took the
+#    slot. (`release`'s exit status carries no signal, as the header
+#    says; `acquire`'s is the whole answer, which is why case 5 uses it
+#    too.)
+set_lock
+: > "$LOCK/holder"                   # the mid-write state, exactly
+(
+    sleep 0.3
+    printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(date +%s)" > "$LOCK/holder"
+) &
+completer=$!
+if AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+    printf 'FAIL  a waiter took the slot from a holder that was mid-write\n'
+    fails=$((fails + 1))
+else
+    printf 'ok    a holder that completes its record within the grace keeps the slot\n'
+fi
+wait "$completer" 2>/dev/null || true
+
+# 7. And the grace must not become a deadlock: a holder that never
+#    finishes its write is still reclaimed, which is case 5 with an
+#    empty file rather than a missing one. Without this, "require a
+#    well-formed record" could be satisfied by waiting for ever.
+set_lock
+: > "$LOCK/holder"
+if AM_ORACLE_VM_WAIT=20 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+    printf 'ok    acquire still reclaims a lock whose holder record never arrived\n'
+else
+    printf 'FAIL  acquire could not reclaim a lock with an empty holder file\n'
+    fails=$((fails + 1))
+fi
+
 if [ "$fails" -eq 0 ]; then
     echo "PASS  vm slot release ownership"
 else
