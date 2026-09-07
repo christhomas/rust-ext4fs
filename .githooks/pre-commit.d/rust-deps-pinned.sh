@@ -253,11 +253,54 @@ if [ -f Cargo.lock ] && [ -d .github/workflows ]; then
       # `path:` over separate lines, and a line filter sees none of
       # them -- which is how a second repository in this constellation
       # ran this check green with two pins it never examined.
-      bad=$(grep -rnE "$sib(\.git)?([^A-Za-z0-9._-]|\$)" \
-              .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null \
-            | grep -E "\.\./$sib([^A-Za-z0-9._-]|\$)" \
-            | grep -E "v[0-9]+\.[0-9]+\.[0-9]+" \
-            | grep -vE "v${lockver}([^0-9]|\$)")
+      # THREE SPELLINGS, and the third is the one that hid the bug this
+      # check was written for. A clone line may carry the tag as a
+      # literal, or as a variable -- `--branch "$FS_CORE_REF"` -- and
+      # reading only literals means the guard goes quiet exactly when a
+      # repository does the tidier thing.
+      #
+      # That is not a hypothetical ordering either. The fix for the
+      # original drift REPLACED release.yml's literal with the variable,
+      # so a check that reads literals only was blinded by the very
+      # commit that repaired the thing it was meant to catch. Verified:
+      # with `FS_CORE_REF: v0.2.7` in release.yml and the lock at
+      # 0.2.10, the literal-only version exits 0 and prints nothing.
+      bad=""
+      for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+        [ -f "$wf" ] || continue
+        wf_bad=$(awk -v sib="$sib" -v want="v$lockver" -v file="$wf" '
+          # Collect this file`s own env: assignments of the form
+          # NAME: vX.Y.Z, so a variable on a clone line can be resolved
+          # against the file that uses it.
+          /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/ {
+            key = $1; sub(/:$/, "", key); val = $2; env[key] = val
+          }
+          # A clone whose destination is the consumer`s own sibling slot.
+          $0 ~ ("\\.\\./" sib "([^A-Za-z0-9._-]|$)") && /--branch/ {
+            ref = ""
+            for (i = 1; i <= NF; i++) {
+              if ($i == "--branch") { ref = $(i + 1); break }
+            }
+            gsub(/["\047]/, "", ref)
+            if (ref ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) {
+              name = ref
+              gsub(/[$\{\}]/, "", name)
+              resolved = (name in env) ? env[name] : ""
+              if (resolved == "") { next }   # unresolvable here; the
+                                             # *_REF fallback below owns it
+              if (resolved != want) {
+                printf "%s:%d: --branch %s = %s\n", file, NR, ref, resolved
+              }
+              next
+            }
+            if (ref ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && ref != want) {
+              printf "%s:%d: --branch %s\n", file, NR, ref
+            }
+          }
+        ' "$wf")
+        [ -n "$wf_bad" ] && bad="${bad:+$bad
+}$wf_bad"
+      done
 
       # The `actions/checkout` form. A `repository:` naming the sibling,
       # then within the next few lines a `ref:` giving the tag and a
