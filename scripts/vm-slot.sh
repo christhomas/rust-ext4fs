@@ -74,9 +74,42 @@ now() { date +%s; }
 #
 # What actually holds the slot is a RUNNING VM, so that is what is
 # recorded and what staleness is measured against.
+# A HALF-WRITTEN HOLDER FILE IS NOT A HOLDER RECORD.
+#
+# This was `[ -f "$HOLDER" ] || return 1; cat "$HOLDER"`, which succeeds
+# on an EMPTY file — and an empty file is the ordinary state of
+# `cmd_acquire` between its `mkdir` and the `printf` that records who
+# took the slot. Three things then went wrong at once, all downstream of
+# this returning 0:
+#
+#   * the `sleep 1` in `cmd_acquire` exists precisely to let a holder
+#     finish that write, and it is guarded by this failing. It never
+#     fired.
+#   * `holder_field 3` was empty, so `${since:-0}` made the age
+#     `now - 0` — the holder appeared to be 56 years old.
+#   * `holder_is_dead` reads field 1, found it empty, and returns 0 for
+#     "dead" on an empty directory.
+#
+# So a waiter arriving in that window broke the lock of a process that
+# was mid-acquire, and both callers went on to boot a 4 GB machine —
+# which is the exact outcome this file exists to prevent.
+#
+# A record is three tab-separated fields and the third is an epoch
+# second. Anything else is not a record YET, and saying so is what makes
+# the grace period reachable.
 read_holder() {
     [ -f "$HOLDER" ] || return 1
-    cat "$HOLDER" 2>/dev/null
+    local line dir repo since
+    IFS= read -r line < "$HOLDER" 2>/dev/null || return 1
+    [ -n "$line" ] || return 1
+    dir="$(printf '%s' "$line" | cut -f1)"
+    repo="$(printf '%s' "$line" | cut -f2)"
+    since="$(printf '%s' "$line" | cut -f3)"
+    [ -n "$dir" ] && [ -n "$repo" ] || return 1
+    case "$since" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$line"
 }
 
 holder_field() { read_holder | cut -f"$1"; }
