@@ -78,6 +78,46 @@ pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
     | Incompat::EA_INODE.bits()
     | Incompat::CASEFOLD.bits();
 
+/// INCOMPAT bits that are safe to READ and not safe to WRITE.
+///
+/// These are the mirror of [`MAINTAINED_RO_COMPAT`] on the incompat side.
+/// The RO_COMPAT rule — a reader that does not know the bit may read and
+/// must not write — has no INCOMPAT equivalent in the format itself, but
+/// some INCOMPAT features have exactly that shape in practice: this
+/// driver can locate every byte on such a volume, and cannot keep the
+/// structures the bit describes correct once it starts writing.
+///
+/// - `MMP` (multi-mount protection) stops two hosts mounting one
+///   filesystem read-write at once. Honouring it means reading the MMP
+///   block, checking its sequence, writing our own node name, waiting and
+///   re-checking; none of that exists. A reader cannot corrupt anything
+///   and does not affect the other host's protection, so read-only is
+///   fine and writing is not.
+///
+/// - `CASEFOLD` changes how a directory entry's htree slot is CHOSEN: the
+///   kernel hashes the normalised, case-folded name with SipHash-2-4 and
+///   files the entry into the leaf that hash selects. This driver hashes
+///   the raw bytes with half_md4 or tea. Reads survive that by accident,
+///   because `path::find_entry` falls back to a linear scan when the
+///   htree descent misses — slower, and case-insensitive lookup does not
+///   work, but nothing is lost. A write does not survive it: the entry
+///   goes into the leaf the wrong hash names, this driver's linear scan
+///   keeps finding it, and the kernel's htree descent does not. The file
+///   becomes invisible on Linux while still holding its inode and its
+///   directory slot, and `e2fsck` reports the htree as inconsistent.
+///
+/// `casefold.rs` implements the hash and has no callers; neither
+/// `s_encoding` nor `EXT4_CASEFOLD_FL` is read anywhere, so the driver
+/// cannot currently tell that a directory is casefolded at all. Wiring
+/// that up is what would let this bit move out of here.
+pub const WRITE_BREAKING_INCOMPAT: u32 = Incompat::MMP.bits() | Incompat::CASEFOLD.bits();
+
+/// The INCOMPAT bits on this volume that a write here would not keep
+/// consistent. Zero means the volume may be mounted read-write.
+pub fn write_breaking_incompat(feature_incompat: u32) -> u32 {
+    feature_incompat & WRITE_BREAKING_INCOMPAT
+}
+
 /// RO_COMPAT bits we tolerate (since we mount read-only anyway).
 pub const SUPPORTED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
     | RoCompat::LARGE_FILE.bits()
