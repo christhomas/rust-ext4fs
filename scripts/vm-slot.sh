@@ -33,11 +33,16 @@ HOLDER="$LOCK/holder"
 # slot before another waiter is allowed to take it away.
 #
 # The wait is long because a fixture build legitimately takes tens of
-# minutes; the breaking point is longer still, because breaking a lock
-# someone is genuinely using is worse than waiting. Both are overridable
-# for a caller that knows better.
+# minutes, and overridable for a caller that knows better.
+#
+# THERE IS NO "BREAKING POINT" ANY MORE. A second timeout used to take
+# the slot from anyone holding it past 90 minutes regardless of whether
+# their VM was up, which is how a live machine lost its slot to a waiter
+# that then booted a second one. Waiting for a live holder is unbounded
+# on purpose: `--force` is the way out, and it is a person's decision
+# rather than a timer's. `AM_ORACLE_VM_STALE` is gone with it — a knob
+# that silently does nothing is worse than no knob.
 WAIT_SECS="${AM_ORACLE_VM_WAIT:-3600}"
-STALE_SECS="${AM_ORACLE_VM_STALE:-5400}"
 
 # How long a freshly taken slot is trusted before the "is a VM actually
 # running" test is allowed to break it.
@@ -223,10 +228,43 @@ cmd_acquire() {
             break_lock "no VM is running for $(holder_field 2) after $(pretty_age $age)"
             continue
         fi
-        if [ "$age" -gt "$STALE_SECS" ]; then
-            break_lock "held by $(holder_field 2) for $(pretty_age $age), past the $(pretty_age $STALE_SECS) limit"
-            continue
-        fi
+        # THERE IS NO AGE-ALONE BREAK, AND THERE MUST NOT BE.
+        #
+        # IT WAS NOT A TIMER. IT WAS A TRAP THAT ARMED.
+        #
+        # This used to break the lock once `age` passed a second timeout,
+        # without asking whether a VM was still running — and the break
+        # lives inside this wait loop, so nothing happened when the age
+        # was crossed. The lock became takeable, and stayed takeable,
+        # until another repository walked in. That is why it went a day
+        # unnoticed: the condition and the consequence are separated by
+        # however long it takes somebody else to want the slot.
+        #
+        # Measured on the machine this was written for: two VMs ran at
+        # once, their start times 5401 seconds apart against a limit of
+        # 5400, with the lock replaced one second before the second boot.
+        #
+        # 90 minutes is
+        # not a long time for a fixture build, and `vm.sh up` plus
+        # `vm-e2fsck.sh` deliberately leave the machine up between
+        # invocations, so a holder outliving the limit is ordinary. The
+        # waiter took the slot from a live VM and booted a second one —
+        # the exact outcome this file exists to prevent, produced by the
+        # file itself.
+        #
+        # Adding `&& holder_is_dead` to that branch would have made it
+        # unreachable rather than correct: `BOOT_GRACE_SECS` is 180 and
+        # that timeout was 5400, so every dead holder is already broken
+        # above, two orders of magnitude sooner. A dead holder needs no
+        # second rule and a live one must not be robbed by any rule, so
+        # the branch has no remaining job.
+        #
+        # What replaces it is the human. A VM whose owning script died
+        # while the machine kept running is the one case nothing here can
+        # reclaim, and the give-up path below already names the remedy:
+        # `scripts/vm-slot.sh release --force`. Waiting and saying so is
+        # the annoying answer; taking the slot and booting a second 4 GB
+        # machine beside a live one is the damaging answer.
 
         if [ "$announced" = 0 ]; then
             echo "[vm-slot] waiting for the oracle slot — held by $(holder_field 2) for $(pretty_age $age)" >&2
