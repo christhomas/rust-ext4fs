@@ -5570,6 +5570,177 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // The refusal has to come BEFORE journal replay
+    // ---------------------------------------------------------------
+    //
+    // Replay is not a read. It takes the blocks a previous writer
+    // committed to the log and writes them into the filesystem proper.
+    // Doing that to a volume carrying a feature this driver does not
+    // maintain is the exact damage `write_breaking_incompat` exists to
+    // prevent, so the refusal has to happen first.
+    //
+    // On `main` it does, by five lines. Nothing holds it there: move the
+    // refusal below `replay_if_dirty` and every other test still passes,
+    // because the only volumes that carry one of these bits today are
+    // `formatted()` ext4 images and this crate's mkfs writes no journal
+    // for them. The resulting driver would decline the mount *after*
+    // having already written to the disk.
+    //
+    // These two tests fix the order by giving it a witness: a volume
+    // that has both an unsupported bit and a genuinely replayable
+    // journal, and a destination block whose contents say whether the
+    // replay ran.
+
+    /// The block a planted transaction writes to. Chosen well past the
+    /// metadata and the 1024-block journal mkfs lays down for ext3, and
+    /// well inside a 32 MiB device, so replay's own bounds checks have
+    /// no reason to refuse it.
+    const REPLAY_TARGET_BLOCK: u64 = 4000;
+
+    /// Format an ext3 volume — the one flavour whose mkfs writes a real
+    /// journal — and leave a single committed transaction in it that
+    /// replay has not yet applied.
+    ///
+    /// Returns the device and the payload the transaction will write to
+    /// `REPLAY_TARGET_BLOCK`, which is what the caller checks for.
+    fn ext3_with_a_dirty_journal() -> (std::sync::Arc<MemDev>, Vec<u8>) {
+        let dev = MemDev::new(VOL);
+        crate::mkfs::format_filesystem_with_flavor(
+            dev.as_ref(),
+            Some("replay"),
+            None,
+            VOL,
+            BS,
+            crate::features::FsFlavor::Ext3,
+        )
+        .expect("format ext3");
+
+        let payload = {
+            let fs = Filesystem::mount(dev.clone()).expect("mount to plant the journal");
+            let block_size = fs.sb.block_size() as u64;
+
+            let raw = fs
+                .read_inode_raw(fs.sb.journal_inode)
+                .expect("read the journal inode");
+            let jinode = crate::inode::Inode::parse(&raw).expect("parse the journal inode");
+            let jsb = crate::jbd2::read_superblock(&fs)
+                .expect("read the journal superblock")
+                .expect("ext3 has a journal");
+
+            // One transaction, one write tag: descriptor, data, commit.
+            let mut tx = crate::transaction::Transaction::begin(
+                jsb.sequence,
+                block_size as u32,
+                jsb.uses_64bit(),
+                jsb.feature_incompat & crate::jbd2::JbdIncompat::CSUM_V3.bits() != 0,
+            );
+            let payload: Vec<u8> = (0..block_size as usize)
+                .map(|i| 0xA5u8.wrapping_add((i & 0xFF) as u8))
+                .collect();
+            tx.add_write(REPLAY_TARGET_BLOCK, payload.clone())
+                .expect("add_write");
+            let blocks = tx.commit().expect("commit");
+            assert_eq!(blocks.len(), 3, "descriptor + data + commit");
+
+            // Journal logical block 0 is the journal superblock, so the
+            // log itself starts at 1.
+            for (i, blk) in blocks.iter().enumerate() {
+                let phys = crate::jbd2::journal_block_to_physical(&fs, &jinode, (i as u64) + 1)
+                    .expect("map the journal block")
+                    .expect("the journal is contiguous, so it is mapped");
+                fs.dev
+                    .write_at(phys * block_size, blk)
+                    .expect("write the journal slot");
+            }
+
+            // s_start is at offset 0x1C and JBD2 is big-endian. Setting
+            // it to 1 is what makes the journal dirty.
+            let jsb_phys = crate::jbd2::journal_block_to_physical(&fs, &jinode, 0)
+                .expect("map the journal superblock")
+                .expect("mapped");
+            let mut jsb_bytes = vec![0u8; block_size as usize];
+            fs.dev
+                .read_at(jsb_phys * block_size, &mut jsb_bytes)
+                .expect("read the journal superblock");
+            assert_eq!(
+                u32::from_be_bytes(jsb_bytes[0..4].try_into().unwrap()),
+                crate::jbd2::JBD2_MAGIC_NUMBER,
+                "the block the journal inode maps is not a JBD2 superblock"
+            );
+            jsb_bytes[0x1C..0x20].copy_from_slice(&1u32.to_be_bytes());
+            fs.dev
+                .write_at(jsb_phys * block_size, &jsb_bytes)
+                .expect("write the journal superblock");
+            fs.dev.flush().expect("flush");
+            payload
+        };
+
+        assert!(
+            !destination_holds_the_payload(&dev, &payload),
+            "the destination already holds the payload, so replaying could not be observed"
+        );
+        (dev, payload)
+    }
+
+    /// Whether the transaction's payload has reached its destination —
+    /// which is to say, whether replay ran.
+    ///
+    /// Returns a bool rather than the block so a failure prints one line
+    /// instead of two 4096-byte vectors.
+    fn destination_holds_the_payload(dev: &std::sync::Arc<MemDev>, payload: &[u8]) -> bool {
+        let mut buf = vec![0u8; BS as usize];
+        crate::block_io::BlockDevice::read_at(
+            dev.as_ref(),
+            REPLAY_TARGET_BLOCK * BS as u64,
+            &mut buf,
+        )
+        .expect("read the destination block");
+        buf == payload
+    }
+
+    /// The control. Without an unsupported bit, this volume's journal
+    /// really does replay at mount, so the assertion below it — that
+    /// the destination is untouched — is a statement about the refusal
+    /// and not about a journal that was never going to replay anyway.
+    #[test]
+    fn a_dirty_journal_is_replayed_at_mount() {
+        let (dev, payload) = ext3_with_a_dirty_journal();
+        let fs = Filesystem::mount(dev.clone()).expect("mount");
+        drop(fs);
+        assert!(
+            destination_holds_the_payload(&dev, &payload),
+            "mount did not replay a dirty journal"
+        );
+    }
+
+    /// And with one, the mount is refused and the journal is left alone.
+    ///
+    /// The refusal on its own proves nothing: a driver that replayed
+    /// first and refused afterwards would still return this error. What
+    /// separates the two orders is whether the log was consumed, which
+    /// is what the second assertion reads.
+    #[test]
+    fn an_unsupported_bit_is_refused_before_the_journal_is_replayed() {
+        let (dev, payload) = ext3_with_a_dirty_journal();
+        set_incompat_bit(&dev, crate::features::Incompat::CASEFOLD.bits());
+
+        match Filesystem::mount(dev.clone()) {
+            Ok(_) => panic!("a writable mount of a CASEFOLD volume must be refused"),
+            Err(Error::UnsupportedIncompat(bits)) => assert_eq!(
+                bits,
+                crate::features::Incompat::CASEFOLD.bits(),
+                "the refusal must name the bit responsible"
+            ),
+            Err(other) => panic!("expected UnsupportedIncompat, got {other:?}"),
+        }
+
+        assert!(
+            !destination_holds_the_payload(&dev, &payload),
+            "the journal was replayed into a volume the driver had already declined to mount"
+        );
+    }
+
+    // ---------------------------------------------------------------
     // EA_INODE: an attribute whose value lives in another inode
     // ---------------------------------------------------------------
 
