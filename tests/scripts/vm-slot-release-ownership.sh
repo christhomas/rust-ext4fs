@@ -199,6 +199,9 @@ fi
 #     Asserted the same way as case 6, because the observable
 #     consequence is the same one: a waiter must not take the slot from
 #     a holder that completes its record within the grace.
+# The four-field case moved out of this list when the generation token
+# arrived: four is now a record this script writes, and the upward bound
+# is five.
 for bad in '123' '/d\tr\t1\tt\textra'; do
     set_lock
     printf "$bad\n" > "$LOCK/holder"
