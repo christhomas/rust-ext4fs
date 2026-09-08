@@ -383,14 +383,50 @@ if [ -f Cargo.lock ] && [ -d .github/workflows ]; then
       for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
         [ -f "$wf" ] || continue
         checkout_bad=$(awk -v sib="$sib" -v want="v$lockver" -v file="$wf" '
-          $0 ~ ("repository:[[:space:]]*.*/" sib "[[:space:]]*$") { inblk = 1; ln = NR; ref = ""; pth = ""; next }
+          # THIS BLOCK NEEDS ITS OWN env: MAP. It resolves
+          # `${{ env.NAME }}` below, and without collecting the
+          # assignments first every such pin reads as unresolvable --
+          # which is how the first version of this reported "cannot
+          # resolve" for a workflow whose variable was declared eight
+          # lines above the clone that used it.
+          FNR == NR {
+            if ($0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/) {
+              k = $1; sub(/:$/, "", k); env[k] = $2
+            }
+            next
+          }
+          /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/ {
+            k = $1; sub(/:$/, "", k); env[k] = $2
+          }
+          $0 ~ ("repository:[[:space:]]*.*/" sib "[[:space:]]*$") { inblk = 1; ln = FNR; ref = ""; pth = ""; unresolved = 0; next }
           inblk {
+            # A literal tag, or `${{ env.NAME }}` resolved against the
+            # env: map. WITHOUT THE SECOND FORM, converting a repository
+            # to a single shared variable -- the tidier arrangement, and
+            # the one worth encouraging -- would make its pins invisible
+            # here. That has already happened twice in this
+            # constellation: once for a workflow `env:` variable and
+            # once for a `chores.yml` value read through a shell helper.
+            # A guard that goes quiet when a repository improves is
+            # worse than one that never looked.
             if ($0 ~ /ref:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+/) { ref = $NF }
+            else if ($0 ~ /ref:[[:space:]]*\$\{\{[[:space:]]*env\./) {
+              nm = $0
+              sub(/^.*env\./, "", nm)
+              sub(/[^A-Za-z0-9_].*$/, "", nm)
+              if (nm in env) { ref = env[nm] }
+              else { ref = "$" nm; unresolved = 1 }
+            }
             if ($0 ~ /path:[[:space:]]*/) { pth = $NF }
-            if (NR - ln > 4 || ($0 ~ /^[[:space:]]*-/ && NR > ln)) {
-              if (ref != "" && ref != want && (pth == sib || pth == ".." "/" sib)) {
-                printf "%s:%d: ref: %s\n", file, ln, ref
+            if (FNR - ln > 4 || ($0 ~ /^[[:space:]]*-/ && FNR > ln)) {
+              if (ref != "" && (pth == sib || pth == ".." "/" sib)) {
+                if (unresolved) {
+                  printf "%s:%d: ref: %s (cannot resolve; not checked)\n", file, ln, ref
+                } else if (ref != want) {
+                  printf "%s:%d: ref: %s\n", file, ln, ref
+                }
               }
+              unresolved = 0
               inblk = 0
             }
           }
@@ -399,7 +435,7 @@ if [ -f Cargo.lock ] && [ -d .github/workflows ]; then
               printf "%s:%d: ref: %s\n", file, ln, ref
             }
           }
-        ' "$wf")
+        ' "$wf" "$wf")
         [ -n "$checkout_bad" ] && bad="${bad:+$bad
 }$checkout_bad"
       done
