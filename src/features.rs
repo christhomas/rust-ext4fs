@@ -231,29 +231,13 @@ pub const READ_BREAKING_RO_COMPAT: u32 = RoCompat::BIGALLOC.bits();
 ///   to having plugged the disk into a Mac.
 /// - `ORPHAN_PRESENT` is absent for the same reason: the orphan file is
 ///   read (see `Filesystem::orphan_list`) and not maintained.
-/// - `GDT_CSUM` is absent, and this one is easy to get wrong because it
-///   *looks* maintained. [`crate::checksum::Checksummer::from_superblock`]
-///   sets `enabled` from `METADATA_CSUM` alone, and the only code that
-///   writes a group-descriptor checksum --
-///   `Filesystem::buffer_patch_bgd_counters` -- is behind
-///   `if self.csum.enabled`. So on a volume with `GDT_CSUM` and not
-///   `METADATA_CSUM`, this driver edits group descriptors and never
-///   touches their checksums, and `e2fsck` reports every one it wrote.
-///
-///   The two features also do not share an algorithm. `METADATA_CSUM`
-///   descriptors are crc32c; `GDT_CSUM` descriptors are **crc16**, which
-///   this crate does not implement at all. Even reaching that code with
-///   `enabled` forced true would compute the wrong value rather than the
-///   right one.
-///
-///   That combination is not exotic. It is what `mke2fs` produced by
-///   default before 1.43, so it is the ordinary shape of an older disk.
-///   Refusing to write one is the honest answer until the crc16 path
-///   exists; reading is unaffected.
+/// - `GDT_CSUM` uses CRC16 group descriptors; bitmap and inode checksums
+///   remain exclusive to metadata_csum. Every descriptor mutation maintains it.
 ///
 /// Everything else in [`SUPPORTED_RO_COMPAT`] describes structures the
 /// write paths already keep correct.
 pub const MAINTAINED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
+    | RoCompat::GDT_CSUM.bits()
     | RoCompat::LARGE_FILE.bits()
     | RoCompat::HUGE_FILE.bits()
     | RoCompat::DIR_NLINK.bits()

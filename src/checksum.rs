@@ -38,6 +38,56 @@ pub fn linux_crc32c(seed: u32, data: &[u8]) -> u32 {
     !crc32c::crc32c_append(!seed, data)
 }
 
+/// Linux CRC16 (reflected polynomial 0x8005, no final XOR).
+fn linux_crc16(mut crc: u16, bytes: &[u8]) -> u16 {
+    for &byte in bytes {
+        crc ^= u16::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ if crc & 1 != 0 { 0xa001 } else { 0 };
+        }
+    }
+    crc
+}
+
+/// Group checksum for either metadata_csum (CRC32C) or gdt_csum (CRC16).
+/// CRC16 excludes bytes 0x1e..0x20; CRC32C includes two zero bytes there.
+/// See the Linux ext4 group-descriptor format, not bitmap-checksum rules.
+pub(crate) fn group_descriptor_checksum(
+    sb: &Superblock,
+    csum: &Checksummer,
+    group: u32,
+    raw: &[u8],
+) -> Option<u16> {
+    let raw = raw.get(..usize::from(sb.desc_size))?;
+    if raw.len() < 32 {
+        return None;
+    }
+    if csum.enabled {
+        let mut crc = linux_crc32c(csum.seed, &group.to_le_bytes());
+        crc = linux_crc32c(crc, &raw[..0x1e]);
+        crc = linux_crc32c(crc, &[0, 0]);
+        Some(linux_crc32c(crc, &raw[0x20..]) as u16)
+    } else if sb.feature_ro_compat & RoCompat::GDT_CSUM.bits() != 0 {
+        let mut crc = linux_crc16(!0, &sb.uuid);
+        crc = linux_crc16(crc, &group.to_le_bytes());
+        crc = linux_crc16(crc, &raw[..0x1e]);
+        Some(linux_crc16(crc, &raw[0x20..]))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn patch_group_descriptor(
+    sb: &Superblock,
+    csum: &Checksummer,
+    group: u32,
+    raw: &mut [u8],
+) {
+    if let Some(value) = group_descriptor_checksum(sb, csum, group, raw) {
+        raw[0x1e..0x20].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
 /// Per-mount checksum context: the seed and "is it enabled" flag.
 #[derive(Debug, Clone, Copy)]
 pub struct Checksummer {
