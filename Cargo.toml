@@ -49,3 +49,6 @@ panic = "unwind"  # required for catch_unwind at FFI boundary (see src/capi.rs)
 [profile.dev]
 opt-level = 1
 panic = "unwind"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
