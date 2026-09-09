@@ -167,53 +167,15 @@ fn a_default_volume_still_writes() {
         .expect("an ordinary volume must still accept a create");
 }
 
-/// A volume with `GDT_CSUM` and not `METADATA_CSUM` refuses a write.
-///
-/// This one was in the maintained set when the guard first landed, and
-/// it should not have been. The mistake is worth recording because the
-/// bit *looks* maintained from the feature table: group-descriptor
-/// checksums are computed and verified elsewhere in the crate, so it
-/// reads as covered.
-///
-/// It is not. `Checksummer::from_superblock` sets `enabled` from
-/// `METADATA_CSUM` alone, and the only writer of a descriptor checksum,
-/// `buffer_patch_bgd_counters`, sits behind `if self.csum.enabled`. So
-/// on a volume with `GDT_CSUM` and not `METADATA_CSUM` this driver
-/// edited group descriptors and left every checksum stale, which is the
-/// same shape of harm as the `QUOTA` case the guard was built for.
-///
-/// The two are not even the same algorithm: `METADATA_CSUM` descriptors
-/// are crc32c and `GDT_CSUM` descriptors are crc16, which this crate
-/// does not implement. So this is a refusal until that exists, not an
-/// oversight to be patched by flipping a flag.
-///
-/// `mke2fs` produced exactly this combination by default before 1.43,
-/// so the volume being refused here is an ordinary older disk rather
-/// than a contrived one.
+/// Flipping feature bits does not convert existing CRC32C descriptors to CRC16.
+/// The reader now validates legacy descriptor checksums before any writes.
 #[test]
-fn a_gdt_csum_volume_without_metadata_csum_refuses_a_write() {
+fn changing_checksum_dialect_without_recomputing_descriptors_is_rejected() {
     let dev = edited_fixture(RoCompat::GDT_CSUM.bits(), RoCompat::METADATA_CSUM.bits());
-    let fs = Filesystem::mount(dev).expect("the volume must still be readable");
-
-    // Readable: the group descriptors parse and the root resolves.
-    let (inode, _raw) = fs.read_inode_verified(2).expect("read the root inode");
-    assert!(
-        inode.size > 0,
-        "the root inode came back describing nothing"
-    );
-
-    match fs.apply_create("/gdt_csum.txt", 0o644) {
-        Err(Error::UnsupportedRoCompat(bits)) => {
-            assert_eq!(
-                bits & RoCompat::GDT_CSUM.bits(),
-                RoCompat::GDT_CSUM.bits(),
-                "the refusal should name GDT_CSUM"
-            );
-        }
-        Err(other) => panic!("wrong refusal: {other:?}"),
-        Ok(_) => panic!(
-            "a create must be refused: this driver would leave every \
-             group-descriptor checksum it touched stale"
-        ),
-    }
+    assert!(matches!(
+        Filesystem::mount(dev),
+        Err(Error::BadChecksum {
+            what: "block group descriptor"
+        })
+    ));
 }

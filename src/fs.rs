@@ -1591,12 +1591,12 @@ impl Filesystem {
                 .copy_from_slice(&(((csum >> 16) & 0xFFFF) as u16).to_le_bytes());
         }
         // Refresh the BGD checksum (0x1E) so the descriptor stays consistent.
-        let stored_at = off + 0x1E;
-        let end_desc = off + desc_size as usize;
-        block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
-        let mut c = crate::checksum::linux_crc32c(self.csum.seed, &(gi as u32).to_le_bytes());
-        c = crate::checksum::linux_crc32c(c, &block[off..end_desc]);
-        block[stored_at..stored_at + 2].copy_from_slice(&(c as u16).to_le_bytes());
+        crate::checksum::patch_group_descriptor(
+            &self.sb,
+            &self.csum,
+            gi as u32,
+            &mut block[off..off + desc_size as usize],
+        );
         Ok(())
     }
 
@@ -1709,15 +1709,12 @@ impl Filesystem {
                 block[off + 0x32..off + 0x34]
                     .copy_from_slice(&(((floor >> 16) & 0xFFFF) as u16).to_le_bytes());
             }
-            if self.csum.enabled {
-                let stored_at = off + 0x1E;
-                let end_desc = off + desc_size as usize;
-                block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
-                let seed = self.csum.seed;
-                let mut c = crate::checksum::linux_crc32c(seed, &(gi as u32).to_le_bytes());
-                c = crate::checksum::linux_crc32c(c, &block[off..end_desc]);
-                block[stored_at..stored_at + 2].copy_from_slice(&(c as u16).to_le_bytes());
-            }
+            crate::checksum::patch_group_descriptor(
+                &self.sb,
+                &self.csum,
+                gi as u32,
+                &mut block[off..off + desc_size as usize],
+            );
         }
         Ok(())
     }
@@ -1772,16 +1769,12 @@ impl Filesystem {
             used_dirs_delta,
         );
 
-        if self.csum.enabled {
-            let stored_at = off_in_block + 0x1E;
-            let end_desc = off_in_block + desc_size as usize;
-            block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
-            let seed = self.csum.seed;
-            let mut c = crate::checksum::linux_crc32c(seed, &(gi as u32).to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[off_in_block..end_desc]);
-            let new_csum = c as u16;
-            block[stored_at..stored_at + 2].copy_from_slice(&new_csum.to_le_bytes());
-        }
+        crate::checksum::patch_group_descriptor(
+            &self.sb,
+            &self.csum,
+            gi as u32,
+            &mut block[off_in_block..off_in_block + desc_size as usize],
+        );
         Ok(())
     }
 
@@ -3804,16 +3797,12 @@ impl Filesystem {
             used_dirs_delta,
         );
 
-        if self.csum.enabled {
-            let stored_at = off_in_block + 0x1E;
-            let end_desc = off_in_block + desc_size as usize;
-            block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
-            let seed = self.csum.seed;
-            let mut c = crate::checksum::linux_crc32c(seed, &(gi as u32).to_le_bytes());
-            c = crate::checksum::linux_crc32c(c, &block[off_in_block..end_desc]);
-            let new_csum = c as u16;
-            block[stored_at..stored_at + 2].copy_from_slice(&new_csum.to_le_bytes());
-        }
+        crate::checksum::patch_group_descriptor(
+            &self.sb,
+            &self.csum,
+            gi as u32,
+            &mut block[off_in_block..off_in_block + desc_size as usize],
+        );
         self.dev.write_at(bgt_block * bs, &block)?;
         Ok(())
     }
