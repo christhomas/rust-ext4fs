@@ -296,8 +296,9 @@ fn committed_plain_journal_matches_linux_and_refreshes_mount_metadata() {
 /// or all writes since the last completed flush may disappear at power loss.
 struct InterruptedDevice {
     inner: FileDevice,
-    fail_at: usize,
+    fail_at: AtomicUsize,
     event: AtomicUsize,
+    reads: AtomicUsize,
     writeback: bool,
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
 }
@@ -305,7 +306,7 @@ struct InterruptedDevice {
 impl InterruptedDevice {
     fn gate(&self) -> Result<()> {
         let event = self.event.fetch_add(1, Ordering::SeqCst);
-        if event >= self.fail_at {
+        if event >= self.fail_at.load(Ordering::SeqCst) {
             self.pending.lock().unwrap().clear();
             return Err(Error::Corrupt("injected I/O interruption"));
         }
@@ -315,6 +316,7 @@ impl InterruptedDevice {
 
 impl BlockDevice for InterruptedDevice {
     fn read_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_at(offset, bytes)?;
         for (start, data) in self.pending.lock().unwrap().iter() {
             let left = offset.max(*start);
@@ -353,8 +355,9 @@ impl BlockDevice for InterruptedDevice {
 fn interrupted_mount(path: &Path, fail_at: usize, writeback: bool) -> (bool, usize) {
     let device = Arc::new(InterruptedDevice {
         inner: FileDevice::open_rw(path.to_str().unwrap()).unwrap(),
-        fail_at,
+        fail_at: AtomicUsize::new(fail_at),
         event: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
         writeback,
         pending: Mutex::new(Vec::new()),
     });
@@ -386,4 +389,43 @@ fn linux_recovers_every_checked_replay_write_and_flush_interruption() {
             "independent e2fsck recovery: {events} write/flush boundaries; writeback={writeback}"
         );
     }
+}
+
+#[test]
+fn finish_after_a_failed_journal_operation_issues_no_device_io() {
+    let fixture = Fixture::new(false);
+    let image = fixture.copy("failed-operation-finish");
+    let device = Arc::new(InterruptedDevice {
+        inner: FileDevice::open_rw(image.to_str().unwrap()).unwrap(),
+        fail_at: AtomicUsize::new(usize::MAX),
+        event: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+        writeback: true,
+        pending: Mutex::new(Vec::new()),
+    });
+    let mounted = Filesystem::mount_recovering(device.clone()).expect("checked mount");
+    device
+        .fail_at
+        .store(device.event.load(Ordering::SeqCst), Ordering::SeqCst);
+    assert!(
+        mounted.apply_chmod("/oracle", 0o640).is_err(),
+        "journal write must fail"
+    );
+    let events = device.event.load(Ordering::SeqCst);
+    let reads = device.reads.load(Ordering::SeqCst);
+    assert!(
+        mounted.finish().is_err(),
+        "failed journal must not claim a clean finish"
+    );
+    assert_eq!(
+        device.event.load(Ordering::SeqCst),
+        events,
+        "finish must not write or flush after a journal failure"
+    );
+    assert_eq!(
+        device.reads.load(Ordering::SeqCst),
+        reads,
+        "finish must stop before further device reads"
+    );
+    fixture.linux_recover(&image);
 }

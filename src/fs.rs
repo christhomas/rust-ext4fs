@@ -303,10 +303,6 @@ impl Filesystem {
     /// not claim a clean release: the recovery marker remains for the next owner.
     /// After any I/O failure, release ownership and reopen rather than reusing it.
     pub fn finish(mut self) -> Result<()> {
-        self.dev.flush()?;
-        if !self.managed_recovery {
-            return Ok(());
-        }
         if let Some(writer) = &self.journal {
             if !writer
                 .lock()
@@ -317,6 +313,10 @@ impl Filesystem {
                     "journal operation failed; reopen for recovery",
                 ));
             }
+        }
+        self.dev.flush()?;
+        if !self.managed_recovery {
+            return Ok(());
         }
         let jsb =
             crate::jbd2::read_superblock(&self)?.ok_or(Error::Corrupt("journal disappeared"))?;
@@ -336,6 +336,7 @@ impl Filesystem {
         if sb.block_size() != self.sb.block_size()
             || sb.blocks_count != self.sb.blocks_count
             || sb.uuid != self.sb.uuid
+            || sb.raw[0xd0..0xe8] != self.sb.raw[0xd0..0xe8]
         {
             return Err(Error::Corrupt(
                 "journal changed filesystem identity or geometry",
