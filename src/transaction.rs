@@ -103,38 +103,59 @@ impl Transaction {
     pub fn commit(&self) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
 
+        // A transaction may touch more blocks than a single descriptor can tag.
+        // JBD2 permits several descriptor blocks per transaction, each followed
+        // by its own data blocks and each ending in a LAST_TAG. Emit as many as
+        // the write set needs instead of failing the whole write.
         if !self.writes.is_empty() {
-            // Descriptor block + data blocks.
-            out.push(self.build_descriptor_block()?);
-            for w in &self.writes {
-                out.push(w.bytes.clone());
+            let per = self.tags_per_descriptor();
+            for chunk in self.writes.chunks(per) {
+                out.push(self.build_descriptor_block(chunk)?);
+                for w in chunk {
+                    out.push(w.bytes.clone());
+                }
             }
         }
         if !self.revokes.is_empty() {
-            out.push(self.build_revoke_block()?);
+            let per = self.revokes_per_block();
+            for chunk in self.revokes.chunks(per) {
+                out.push(self.build_revoke_block(chunk)?);
+            }
         }
         out.push(self.build_commit_block()?);
         Ok(out)
     }
 
-    fn build_descriptor_block(&self) -> Result<Vec<u8>> {
-        let mut blk = vec![0u8; self.block_size as usize];
-        self.write_header(&mut blk, JBD2_DESCRIPTOR_BLOCK);
-
-        let tag_size = if self.uses_csum_v3 {
-            if self.uses_64bit {
-                16
-            } else {
-                12
-            }
+    /// Size of one on-disk tag for this journal's feature set.
+    fn tag_size(&self) -> usize {
+        if self.uses_csum_v3 {
+            if self.uses_64bit { 16 } else { 12 }
         } else if self.uses_64bit {
             12
         } else {
             8
-        };
+        }
+    }
+
+    /// How many tags fit in one descriptor block, after its 12-byte header.
+    fn tags_per_descriptor(&self) -> usize {
+        ((self.block_size as usize - 12) / self.tag_size()).max(1)
+    }
+
+    /// How many revoke records fit in one revoke block, after header + count.
+    fn revokes_per_block(&self) -> usize {
+        let record_size = if self.uses_64bit { 8 } else { 4 };
+        ((self.block_size as usize - 16) / record_size).max(1)
+    }
+
+    fn build_descriptor_block(&self, writes: &[JournaledBlock]) -> Result<Vec<u8>> {
+        let mut blk = vec![0u8; self.block_size as usize];
+        self.write_header(&mut blk, JBD2_DESCRIPTOR_BLOCK);
+
+        let tag_size = self.tag_size();
         let mut pos = 12usize;
-        let last_idx = self.writes.len().saturating_sub(1);
-        for (i, w) in self.writes.iter().enumerate() {
+        let last_idx = writes.len().saturating_sub(1);
+        for (i, w) in writes.iter().enumerate() {
             let mut flags: u32 = if i == last_idx { TAG_LAST } else { 0 };
             // Always set SAME_UUID so we don't have to carry a per-tag UUID
             // (journal's own s_uuid is used implicitly).
@@ -168,19 +189,19 @@ impl Transaction {
         Ok(blk)
     }
 
-    fn build_revoke_block(&self) -> Result<Vec<u8>> {
+    fn build_revoke_block(&self, revokes: &[u64]) -> Result<Vec<u8>> {
         let mut blk = vec![0u8; self.block_size as usize];
         self.write_header(&mut blk, JBD2_REVOKE_BLOCK);
 
         let record_size = if self.uses_64bit { 8 } else { 4 };
-        let records_bytes = self.revokes.len() * record_size;
+        let records_bytes = revokes.len() * record_size;
         let total_bytes = 16 + records_bytes; // header(12) + count(4) + records
         if total_bytes > blk.len() {
             return Err(Error::Corrupt("revoke block overflow"));
         }
         blk[12..16].copy_from_slice(&(total_bytes as u32).to_be_bytes());
         let mut pos = 16usize;
-        for &b in &self.revokes {
+        for &b in revokes {
             if self.uses_64bit {
                 blk[pos..pos + 8].copy_from_slice(&b.to_be_bytes());
             } else {
