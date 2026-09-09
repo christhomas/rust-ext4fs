@@ -848,25 +848,15 @@ fn build_superblock(
     // s_last_mounted (64 bytes at 0x88) stays zero.
     // Algorithm bits / prealloc / reserved (0xC8..0xD8) zero.
 
-    // s_journal_inum at 0xE0..0xE4 — set to inode 8 for ext3 (HAS_JOURNAL),
-    // zero for everything else. (The 0xD8 region holds algorithm bits +
-    // prealloc counters, NOT the journal inode pointer.)
-    // 0xE0..0xE4 is s_journal_inum, which the line below writes. The two
-    // comments that used to sit here named it 0xDC (s_journal_dev) and
-    // then claimed 0xE0 was s_last_orphan — contradicting the write
-    // immediately above them and this crate's own reader, which parses
-    // the journal inode from 0xE0 and documents s_last_orphan at 0xE8.
-    //
-    // s_journal_dev (0xDC) and s_last_orphan (0xE8) are both left zero;
-    // neither is written here.
+    // s_journal_inum, s_journal_dev, s_last_orphan are at 0xE0, 0xE4,
+    // 0xE8 respectively. The latter two stay zero on a new filesystem.
     sb[0xE0..0xE4].copy_from_slice(&journal_inum.to_le_bytes());
-    // 0xE4..0xF4 s_hash_seed[4] — pick a stable nonzero seed. (Only matters
-    // if HTree is in play; we don't set DIR_INDEX, but ext4 formatter still seeds
-    // these so tools don't whine.)
-    sb[0xE4..0xE8].copy_from_slice(&0xC1A2B3C4u32.to_le_bytes());
-    sb[0xE8..0xEC].copy_from_slice(&0xD5E6F7A8u32.to_le_bytes());
-    sb[0xEC..0xF0].copy_from_slice(&0xB9CADBECu32.to_le_bytes());
-    sb[0xF0..0xF4].copy_from_slice(&0xFD0E1F2Au32.to_le_bytes());
+    // s_hash_seed starts at 0xEC, after the orphan head. An earlier offset
+    // fabricated a huge orphan inode number that mount silently ignored.
+    sb[0xEC..0xF0].copy_from_slice(&0xC1A2B3C4u32.to_le_bytes());
+    sb[0xF0..0xF4].copy_from_slice(&0xD5E6F7A8u32.to_le_bytes());
+    sb[0xF4..0xF8].copy_from_slice(&0xB9CADBECu32.to_le_bytes());
+    sb[0xF8..0xFC].copy_from_slice(&0xFD0E1F2Au32.to_le_bytes());
 
     sb[0xFC] = 1; // s_def_hash_version = HALF_MD4
                   // 0xFD reserved_char_pad

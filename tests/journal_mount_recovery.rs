@@ -1,0 +1,389 @@
+//! Independent Linux/e2fsprogs oracle for the checked plain-JBD2 lifecycle.
+//!
+//! Fixture bytes are encoded here, independently of the library transaction
+//! writer. Every image is disposable; no kernel mount or physical device is
+//! involved. Requires mkfs.ext4, debugfs and e2fsck on PATH.
+#![cfg(target_os = "linux")]
+
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::error::{Error, Result};
+use fs_ext4::{jbd2, Filesystem};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+const BLOCK: usize = 4096;
+const SEQUENCE: u32 = 42;
+const RECOVER: u32 = 4;
+const EXPECTED_MODE: u16 = 0o100600;
+const LABEL: &str = "journal-oracle";
+
+fn command(program: &str, args: &[&str]) -> Output {
+    Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap_or_else(|error| panic!("{program} is required for this oracle: {error}"))
+}
+
+fn successful(program: &str, args: &[&str]) -> String {
+    let output = command(program, args);
+    assert!(output.status.success(), "{program}: {output:?}");
+    String::from_utf8(output.stdout).expect("tool output")
+}
+
+fn put_be(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+fn le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+fn be(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+fn header(kind: u32, sequence: u32) -> Vec<u8> {
+    let mut block = vec![0; BLOCK];
+    put_be(&mut block, 0, 0xc03b3998);
+    put_be(&mut block, 4, kind);
+    put_be(&mut block, 8, sequence);
+    block
+}
+
+struct Fixture {
+    dir: PathBuf,
+    pending: PathBuf,
+    inode_block: usize,
+    inode_offset: usize,
+    journal_block: usize,
+}
+
+impl Fixture {
+    fn new(tail_revoke: bool) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "canoe-jbd2-oracle-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).expect("isolated oracle directory");
+        let pending = dir.join("pending.img");
+        File::create(&pending)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let path = pending.to_str().unwrap();
+        successful(
+            "mkfs.ext4",
+            &[
+                "-q",
+                "-F",
+                "-b",
+                "4096",
+                "-I",
+                "256",
+                "-O",
+                "^metadata_csum,^64bit,^orphan_file",
+                "-E",
+                "lazy_itable_init=0,lazy_journal_init=0",
+                path,
+            ],
+        );
+        successful("debugfs", &["-w", "-R", "write /dev/null /oracle", path]);
+        let mapping = successful("debugfs", &["-R", "imap /oracle", path]);
+        let location = mapping
+            .lines()
+            .find(|line| line.contains("located at block"))
+            .unwrap();
+        let words: Vec<_> = location.split_whitespace().collect();
+        let inode_block = words[3].trim_end_matches(',').parse::<usize>().unwrap();
+        let inode_offset = usize::from_str_radix(words[5].trim_start_matches("0x"), 16).unwrap();
+        let journal: Vec<usize> = (0..10)
+            .map(|logical| {
+                successful("debugfs", &["-R", &format!("bmap <8> {logical}"), path])
+                    .trim()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+
+        let mut image = fs::read(&pending).unwrap();
+        let incompat = le(&image, 1024 + 0x60) | RECOVER;
+        image[1024 + 0x60..1024 + 0x64].copy_from_slice(&incompat.to_le_bytes());
+        let mut jsb = image[journal[0] * BLOCK..(journal[0] + 1) * BLOCK].to_vec();
+        assert_eq!(be(&jsb, 0x24), 0, "plain journal compatibility flags");
+        assert_eq!(
+            be(&jsb, 0x28),
+            0,
+            "mkfs journal must have no checksum format"
+        );
+        let uuid = jsb[0x30..0x40].to_vec();
+        put_be(&mut jsb, 0x18, SEQUENCE);
+        put_be(&mut jsb, 0x1c, 1);
+        put_be(&mut jsb, 0x28, 1); // Plain JBD2 with revoke support.
+
+        let mut inode = image[inode_block * BLOCK..(inode_block + 1) * BLOCK].to_vec();
+        assert_ne!(
+            u16::from_le_bytes(inode[inode_offset..inode_offset + 2].try_into().unwrap()),
+            EXPECTED_MODE
+        );
+        inode[inode_offset..inode_offset + 2].copy_from_slice(&EXPECTED_MODE.to_le_bytes());
+        let mut superblock = image[..BLOCK].to_vec();
+        superblock[1024 + 120..1024 + 136].fill(0);
+        superblock[1024 + 120..1024 + 120 + LABEL.len()].copy_from_slice(LABEL.as_bytes());
+
+        // First tag carries the UUID; the second uses SAME_UUID | LAST_TAG.
+        let mut descriptor = header(1, SEQUENCE);
+        put_be(&mut descriptor, 12, inode_block as u32);
+        put_be(&mut descriptor, 16, 0);
+        descriptor[20..36].copy_from_slice(&uuid);
+        put_be(&mut descriptor, 36, 0); // primary superblock lives in fs block 0
+        put_be(&mut descriptor, 40, 2 | 8);
+
+        let mut trailing = header(1, SEQUENCE + 1);
+        put_be(&mut trailing, 12, inode_block as u32);
+        put_be(&mut trailing, 16, 8);
+        trailing[20..36].copy_from_slice(&uuid);
+        let mut uncommitted = inode.clone();
+        uncommitted[inode_offset..inode_offset + 2].copy_from_slice(&0o100777u16.to_le_bytes());
+        let mut blocks = vec![
+            descriptor,
+            inode,
+            superblock,
+            header(2, SEQUENCE),
+            trailing,
+            uncommitted,
+        ];
+        if tail_revoke {
+            let mut revoke = header(5, SEQUENCE + 1);
+            put_be(&mut revoke, 12, 20); // header + count + one 32-bit block
+            put_be(&mut revoke, 16, inode_block as u32);
+            blocks.push(revoke);
+        }
+        blocks.push(vec![0; BLOCK]); // No commit for the trailing transaction.
+        for (index, block) in blocks.iter().enumerate() {
+            let offset = journal[index + 1] * BLOCK;
+            image[offset..offset + BLOCK].copy_from_slice(block);
+        }
+        image[journal[0] * BLOCK..(journal[0] + 1) * BLOCK].copy_from_slice(&jsb);
+        fs::write(&pending, image).unwrap();
+        Self {
+            dir,
+            pending,
+            inode_block,
+            inode_offset,
+            journal_block: journal[0],
+        }
+    }
+
+    fn copy(&self, name: &str) -> PathBuf {
+        let path = self.dir.join(format!("{name}.img"));
+        fs::copy(&self.pending, &path).unwrap();
+        path
+    }
+
+    fn assert_recovered(&self, path: &Path) {
+        let image = fs::read(path).unwrap();
+        let offset = self.inode_block * BLOCK + self.inode_offset;
+        assert_eq!(
+            u16::from_le_bytes(image[offset..offset + 2].try_into().unwrap()),
+            EXPECTED_MODE
+        );
+        assert_eq!(
+            &image[1024 + 120..1024 + 120 + LABEL.len()],
+            LABEL.as_bytes()
+        );
+        assert_eq!(
+            le(&image, 1024 + 0x60) & RECOVER,
+            0,
+            "finished mount must clear RECOVER"
+        );
+        let jsb = &image[self.journal_block * BLOCK..(self.journal_block + 1) * BLOCK];
+        assert_eq!(be(jsb, 0x1c), 0, "journal must be clean");
+        assert!(be(jsb, 0x18) > SEQUENCE, "sequence must advance");
+    }
+
+    fn linux_recover(&self, path: &Path) {
+        let output = command("e2fsck", &["-fy", path.to_str().unwrap()]);
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(path.with_extension("e2fsck.txt"), &transcript).unwrap();
+        assert!(matches!(output.status.code(), Some(0 | 1)), "{transcript}");
+        for unexpected in [
+            "Fix?",
+            "Clear?",
+            "wrong",
+            "corrupt",
+            "Illegal",
+            "UNEXPECTED",
+        ] {
+            assert!(
+                !transcript.contains(unexpected),
+                "recovery required unrelated repair: {transcript}"
+            );
+        }
+        self.assert_recovered(path);
+        self.linux_check(path);
+    }
+
+    fn linux_check(&self, path: &Path) {
+        let output = command("e2fsck", &["-fn", path.to_str().unwrap()]);
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(0), "{transcript}");
+        assert!(
+            !transcript
+                .to_lowercase()
+                .contains("skipping journal recovery"),
+            "{transcript}"
+        );
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::env::var_os("CANOE_JOURNAL_ORACLE_KEEP").is_some() {
+            eprintln!("journal oracle fixtures: {}", self.dir.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn checked_mount(path: &Path) -> Filesystem {
+    Filesystem::mount_recovering(Arc::new(
+        FileDevice::open_rw(path.to_str().unwrap()).unwrap(),
+    ))
+    .expect("checked plain-JBD2 mount")
+}
+
+#[test]
+fn committed_plain_journal_matches_linux_and_refreshes_mount_metadata() {
+    for tail_revoke in [false, true] {
+        let fixture = Fixture::new(tail_revoke);
+        let linux = fixture.copy("linux-oracle");
+        fixture.linux_recover(&linux);
+        let library = fixture.copy("library");
+        let mounted = checked_mount(&library);
+        assert_eq!(
+            mounted.sb.volume_name, LABEL,
+            "replay must refresh the mount's superblock snapshot"
+        );
+        assert_eq!(jbd2::read_superblock(&mounted).unwrap().unwrap().start, 0);
+        mounted.finish().expect("explicit clean finish");
+        fixture.assert_recovered(&library);
+        fixture.linux_check(&library);
+        let after_first_finish = fs::read(&library).unwrap();
+        checked_mount(&library)
+            .finish()
+            .expect("repeat checked mount and finish");
+        assert_eq!(
+            fs::read(&library).unwrap(),
+            after_first_finish,
+            "repeat recovery must be byte-stable"
+        );
+    }
+}
+
+/// Two device persistence models: acknowledged writes may already be durable,
+/// or all writes since the last completed flush may disappear at power loss.
+struct InterruptedDevice {
+    inner: FileDevice,
+    fail_at: usize,
+    event: AtomicUsize,
+    writeback: bool,
+    pending: Mutex<Vec<(u64, Vec<u8>)>>,
+}
+
+impl InterruptedDevice {
+    fn gate(&self) -> Result<()> {
+        let event = self.event.fetch_add(1, Ordering::SeqCst);
+        if event >= self.fail_at {
+            self.pending.lock().unwrap().clear();
+            return Err(Error::Corrupt("injected I/O interruption"));
+        }
+        Ok(())
+    }
+}
+
+impl BlockDevice for InterruptedDevice {
+    fn read_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, bytes)?;
+        for (start, data) in self.pending.lock().unwrap().iter() {
+            let left = offset.max(*start);
+            let right = (offset + bytes.len() as u64).min(*start + data.len() as u64);
+            if left < right {
+                bytes[(left - offset) as usize..(right - offset) as usize]
+                    .copy_from_slice(&data[(left - start) as usize..(right - start) as usize]);
+            }
+        }
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        self.inner.size_bytes()
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.gate()?;
+        if self.writeback {
+            self.pending.lock().unwrap().push((offset, bytes.to_vec()));
+            Ok(())
+        } else {
+            self.inner.write_at(offset, bytes)
+        }
+    }
+    fn flush(&self) -> Result<()> {
+        self.gate()?;
+        for (offset, bytes) in self.pending.lock().unwrap().drain(..) {
+            self.inner.write_at(offset, &bytes)?;
+        }
+        self.inner.flush()
+    }
+}
+
+fn interrupted_mount(path: &Path, fail_at: usize, writeback: bool) -> (bool, usize) {
+    let device = Arc::new(InterruptedDevice {
+        inner: FileDevice::open_rw(path.to_str().unwrap()).unwrap(),
+        fail_at,
+        event: AtomicUsize::new(0),
+        writeback,
+        pending: Mutex::new(Vec::new()),
+    });
+    let result = Filesystem::mount_recovering(device.clone()).and_then(|mounted| mounted.finish());
+    let events = device.event.load(Ordering::SeqCst);
+    (result.is_ok(), events)
+}
+
+#[test]
+fn linux_recovers_every_checked_replay_write_and_flush_interruption() {
+    let fixture = Fixture::new(true);
+    for writeback in [false, true] {
+        let baseline = fixture.copy(&format!("baseline-{writeback}"));
+        let (success, events) = interrupted_mount(&baseline, usize::MAX, writeback);
+        assert!(success);
+        assert!(events >= 4, "must exercise actual writes and flushes");
+        fixture.assert_recovered(&baseline);
+        fixture.linux_check(&baseline);
+        for fail_at in 0..events {
+            let image = fixture.copy(&format!("interrupted-{writeback}-{fail_at}"));
+            let (success, _) = interrupted_mount(&image, fail_at, writeback);
+            assert!(
+                !success,
+                "I/O failure at event {fail_at} must not claim a clean finish"
+            );
+            fixture.linux_recover(&image);
+        }
+        eprintln!(
+            "independent e2fsck recovery: {events} write/flush boundaries; writeback={writeback}"
+        );
+    }
+}

@@ -12,22 +12,12 @@
 //!                              ▼
 //!                   journal_apply::apply  ──▶ final-location disk writes
 //!
-//! Mount flow (when journal is dirty):
-//!
-//! ```text
-//!   1. Parse JBD2 superblock via jbd2::read_superblock.
-//!   2. If !is_clean() AND dev.is_writable():
-//!        plan = journal::walk(&fs, &jsb)?
-//!        journal_apply::apply(&fs, &plan)?
-//!        jbd2::mark_journal_clean(&fs, &jsb)?   // future E11 follow-up
-//!   3. Continue read-only mount.
-//! ```
-//!
-//! Safety: we do NOT yet clear `jsb.start` after apply — that would signal
-//! "clean unmount" and kernel tools would skip replay. Leaving it set means
-//! replaying twice is a no-op (each write is idempotent), so it's safe to
-//! defer the start-field update to a future commit. The kernel itself
-//! tolerates repeated replays.
+//! Replay applies only complete transactions, flushes final-location writes,
+//! and only then advances the journal cursor and flushes its clean marker.
+//! Interrupted replay leaves the old journal available for idempotent recovery.
+//! If the final marker's flush fails, its durability is unknown but both possible
+//! cursor states are safe because data was already flushed. Do not retry writes
+//! on an I/O-failed handle; reopen it under fresh ownership.
 
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
@@ -120,15 +110,19 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
     let jinode = Inode::parse(&raw)?;
     let block_size = fs.sb.block_size() as u64;
 
-    let mut applied = 0usize;
+    // Validate the complete plan before publishing any prefix. Sources and
+    // destinations are image-controlled; a later invalid entry must not turn
+    // an otherwise rejected mount into a partial metadata mutation.
+    let mut locations = Vec::with_capacity(plan.writes.len());
     for w in &plan.writes {
-        // Source: journal_block is a logical block inside the journal inode.
-        // Resolve to a physical fs block via the extent tree, then read one
-        // full block.
         let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
             .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
+        locations.push((byte_offset_of(fs, phys)?, byte_offset_of(fs, w.fs_block)?));
+    }
+    let mut applied = 0usize;
+    for (w, (source, destination)) in plan.writes.iter().zip(locations) {
         let mut buf = vec![0u8; block_size as usize];
-        fs.dev.read_at(byte_offset_of(fs, phys)?, &mut buf)?;
+        fs.dev.read_at(source, &mut buf)?;
 
         // If the ESCAPED flag is set, the first 4 bytes of the journal block
         // were zeroed during write to keep them from colliding with the
@@ -138,7 +132,7 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
         }
 
         // Destination: fs_block * block_size = byte offset on the device.
-        fs.dev.write_at(byte_offset_of(fs, w.fs_block)?, &buf)?;
+        fs.dev.write_at(destination, &buf)?;
         applied += 1;
     }
 
@@ -173,7 +167,12 @@ pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
         return Ok(0);
     }
     let plan = crate::journal::walk(fs, &jsb)?;
-    apply(fs, &plan)
+    let applied = apply(fs, &plan)?;
+    // The final-location writes must be durable before the cursor says clean.
+    // Discarding an incomplete tail also advances beyond its transaction ID.
+    let next_sequence = plan.next_sequence.unwrap_or(jsb.sequence).wrapping_add(1);
+    crate::journal_writer::JournalWriter::finish_replay(fs, next_sequence)?;
+    Ok(applied)
 }
 
 /// Describe the JBD2 superblock fields most relevant to replay decisions.

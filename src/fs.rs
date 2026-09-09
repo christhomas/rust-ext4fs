@@ -212,6 +212,7 @@ fn write_inode_extra_isize(raw: &mut [u8]) {
 }
 
 pub struct Filesystem {
+    managed_recovery: bool,
     pub dev: Arc<dyn BlockDevice>,
     pub sb: Superblock,
     pub groups: Vec<BlockGroupDescriptor>,
@@ -268,6 +269,117 @@ pub(crate) enum BgdUninitFlag {
 }
 
 impl Filesystem {
+    /// Open an exclusively owned, backed-up device with checked journal recovery.
+    /// Opening this writable handle is already a mutation: retain an external
+    /// backup before calling. Only plain JBD2 (no transaction checksums, fast
+    /// commit or async commit) is currently qualified by this lifecycle.
+    pub fn mount_recovering(dev: Arc<dyn BlockDevice>) -> Result<Self> {
+        let mut fs = Self::mount_lazy(dev)?;
+        fs.refuse_write()?;
+        let jsb = crate::jbd2::read_superblock(&fs)?.ok_or(Error::Unsupported(
+            "checked recovery requires an internal journal",
+        ))?;
+        jsb.validate_plain_recovery(fs.sb.block_size(), fs.sb.blocks_count)?;
+        if fs.sb.state & 2 != 0 {
+            return Err(Error::Corrupt("filesystem records an outstanding error"));
+        }
+        fs.journal = None;
+        fs.set_recovery_marker(true)?;
+        crate::journal_apply::replay_if_dirty(&fs)?;
+        fs.refresh_metadata()?;
+        fs.refuse_write()?;
+        crate::jbd2::read_superblock(&fs)?
+            .ok_or(Error::Corrupt("journal disappeared"))?
+            .validate_plain_recovery(fs.sb.block_size(), fs.sb.blocks_count)?;
+        fs.set_recovery_marker(true)?;
+        fs.journal = crate::journal_writer::JournalWriter::open(&fs)?.map(Mutex::new);
+        fs.recover_orphans()?;
+        fs.refresh_metadata()?;
+        fs.managed_recovery = true;
+        Ok(fs)
+    }
+
+    /// Finish a checked mount, propagating flush errors. Dropping a handle does
+    /// not claim a clean release: the recovery marker remains for the next owner.
+    /// After any I/O failure, release ownership and reopen rather than reusing it.
+    pub fn finish(mut self) -> Result<()> {
+        self.dev.flush()?;
+        if !self.managed_recovery {
+            return Ok(());
+        }
+        if let Some(writer) = &self.journal {
+            if !writer
+                .lock()
+                .map_err(|_| Error::Corrupt("journal writer poisoned"))?
+                .is_healthy()
+            {
+                return Err(Error::Corrupt(
+                    "journal operation failed; reopen for recovery",
+                ));
+            }
+        }
+        let jsb =
+            crate::jbd2::read_superblock(&self)?.ok_or(Error::Corrupt("journal disappeared"))?;
+        if !jsb.is_clean() || jsb.errno != 0 {
+            return Err(Error::Corrupt("journal is not checkpointed"));
+        }
+        self.refresh_metadata()?;
+        if self.sb.last_orphan != 0 {
+            return Err(Error::Corrupt("orphan recovery remains incomplete"));
+        }
+        self.set_recovery_marker(false)?;
+        Ok(())
+    }
+
+    fn refresh_metadata(&mut self) -> Result<()> {
+        let sb = Superblock::read(self.dev.as_ref())?;
+        if sb.block_size() != self.sb.block_size()
+            || sb.blocks_count != self.sb.blocks_count
+            || sb.uuid != self.sb.uuid
+        {
+            return Err(Error::Corrupt(
+                "journal changed filesystem identity or geometry",
+            ));
+        }
+        features::check_mountable(sb.feature_incompat, sb.feature_ro_compat)?;
+        let csum = Checksummer::from_superblock(&sb);
+        if csum.enabled && !csum.verify_superblock(&sb.raw) {
+            return Err(Error::BadChecksum {
+                what: "replayed superblock",
+            });
+        }
+        let groups = bgd::read_all(self.dev.as_ref(), &sb, &csum)?;
+        self.flavor = features::FsFlavor::detect(sb.feature_compat, sb.feature_incompat);
+        self.sb = sb;
+        self.groups = groups;
+        self.csum = csum;
+        self.uninit_cleared
+            .lock()
+            .map_err(|_| Error::Corrupt("allocation state poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    fn set_recovery_marker(&mut self, needed: bool) -> Result<()> {
+        let mut sb = Superblock::read(self.dev.as_ref())?;
+        let flag = features::Incompat::RECOVER.bits();
+        let flags = if needed {
+            sb.feature_incompat | flag
+        } else {
+            sb.feature_incompat & !flag
+        };
+        if flags != sb.feature_incompat {
+            sb.raw[0x60..0x64].copy_from_slice(&flags.to_le_bytes());
+            if self.csum.enabled {
+                let checksum = crate::checksum::linux_crc32c(!0, &sb.raw[..0x3fc]);
+                sb.raw[0x3fc..0x400].copy_from_slice(&checksum.to_le_bytes());
+            }
+            self.dev.write_at(1024, &sb.raw)?;
+            self.dev.flush()?;
+        }
+        self.refresh_metadata()
+    }
+
     /// Mount the ext4 filesystem on `dev`. Read-only unless the device reports
     /// `is_writable()`, in which case a dirty journal is replayed before
     /// returning so callers see a consistent on-disk state.
@@ -319,6 +431,7 @@ impl Filesystem {
             256,
         ));
         let mut fs = Self {
+            managed_recovery: false,
             dev,
             sb,
             groups,
@@ -367,12 +480,10 @@ impl Filesystem {
         }
 
         if !defer_replay && fs.dev.is_writable() {
-            // Best-effort: a replay failure here is logged via the returned
-            // error but does NOT abort the mount, because many images have
-            // cosmetic journal issues that shouldn't prevent read access.
-            // The error surfaces up so the caller can decide whether to
-            // retry or proceed; we fail loud rather than silent.
+            // Replay failure aborts this writable mount. A caller needing an
+            // unreplayed diagnostic view must open its device read-only.
             crate::journal_apply::replay_if_dirty(&fs)?;
+            fs.refresh_metadata()?;
         }
 
         // Open the live-write journal writer once replay is done. Any
@@ -401,12 +512,13 @@ impl Filesystem {
         // Phase 6.2 — orphan recovery. Runs after journal replay so any
         // pending kernel-level transactions have already played back;
         // any inode still on the orphan chain at this point is genuinely
-        // dead and we can reclaim it. Best-effort: a recovery failure
-        // surfaces as an error but doesn't abort the mount.
+        // dead or awaiting completion of a truncate. Failure aborts the mount;
+        // never discard an error then clear the orphan list anyway.
         if !defer_replay {
             // `recover_orphans` consults `refuse_write` itself and
             // returns zero when it must not write.
-            let _ = fs.recover_orphans();
+            fs.recover_orphans()?;
+            fs.refresh_metadata()?;
         }
 
         Ok(fs)
@@ -565,10 +677,7 @@ impl Filesystem {
             // Read the orphan's raw bytes (skip csum verify — orphan
             // inodes routinely carry stale csums by design).
             let mut raw = self.read_inode_raw(orphan_ino)?;
-            let parsed = match Inode::parse(&raw) {
-                Ok(i) => i,
-                Err(_) => continue, // unparseable orphan — skip + leak rather than panic
-            };
+            let parsed = Inode::parse(&raw)?;
 
             // STILL NAMED BY A DIRECTORY. This is an interrupted
             // truncate, not a deletion. Finish the truncate and leave
@@ -582,21 +691,19 @@ impl Filesystem {
             // Free data blocks (extents path only — orphan recovery for
             // legacy indirect inodes is a follow-up).
             if parsed.has_extents() && parsed.size > 0 {
-                let (_sc, muts) = match crate::file_mut::plan_truncate_shrink(
-                    parsed.size,
-                    0,
-                    &parsed.block,
-                    bs,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
+                let (_sc, muts) =
+                    crate::file_mut::plan_truncate_shrink(parsed.size, 0, &parsed.block, bs)?;
                 for m in &muts {
                     if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
                         total_freed_blocks +=
                             self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
                     }
                 }
+            }
+            if !parsed.has_extents() && parsed.blocks > 0 {
+                return Err(Error::Unsupported(
+                    "orphan deletion with legacy block mapping",
+                ));
             }
             // Free the inode bitmap slot + BGD free_inodes++.
             self.buffer_free_inode_slot(&mut buf, orphan_ino)?;
@@ -5565,6 +5672,11 @@ mod tests {
     #[test]
     fn an_ordinary_volume_still_mounts_writable() {
         let dev = formatted();
+        assert_eq!(
+            Superblock::read(dev.as_ref()).unwrap().last_orphan,
+            0,
+            "new formatter must not overlap hash seed with orphan head"
+        );
         let fs = Filesystem::mount(dev.clone()).expect("mount");
         fs.apply_create("/after.txt", 0o644).expect("create");
     }
