@@ -108,6 +108,32 @@ pub struct JournalSuperblock {
 }
 
 impl JournalSuperblock {
+    /// The journal format supported by the checked recovery/write lifecycle.
+    /// Feature refusal is a dependency capability boundary, not filesystem damage.
+    pub fn validate_plain_recovery(&self, block_size: u32, blocks_count: u64) -> Result<()> {
+        let supported = JbdIncompat::REVOKE.bits() | JbdIncompat::BIT64.bits();
+        if self.feature_compat != 0
+            || self.feature_ro_compat != 0
+            || self.feature_incompat & !supported != 0
+        {
+            return Err(Error::Unsupported("checked lifecycle supports plain JBD2 only; checksummed/async/fast-commit journals need separate qualification"));
+        }
+        if self.block_type != JBD2_SUPERBLOCK_V2
+            || self.block_size != block_size
+            || self.first != 1
+            || self.max_len <= self.first
+            || u64::from(self.max_len) > blocks_count
+            || (self.start != 0 && (self.start < self.first || self.start >= self.max_len))
+            || self.nr_users != 1
+        {
+            return Err(Error::Corrupt("unsupported internal journal geometry"));
+        }
+        if self.errno != 0 {
+            return Err(Error::Corrupt("journal records an outstanding error"));
+        }
+        Ok(())
+    }
+
     /// True when the log has no outstanding transactions and replay is a no-op.
     pub fn is_clean(&self) -> bool {
         self.start == 0

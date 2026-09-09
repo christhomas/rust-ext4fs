@@ -62,6 +62,7 @@ use crate::transaction::Transaction;
 /// Cheap to construct (one inode read + extent walk). Not thread-safe; the
 /// outer Filesystem lock must serialize mutating ops anyway.
 pub struct JournalWriter {
+    healthy: bool,
     /// `physical_map[logical]` is the fs physical block backing journal
     /// logical block `logical`. Length = `jsb.max_len`. Block 0 is the
     /// JBD2 superblock; blocks 1.. carry transactions.
@@ -127,6 +128,7 @@ impl JournalWriter {
         }
 
         Ok(Some(Self {
+            healthy: true,
             blocks_count: fs.sb.blocks_count,
             physical_map,
             block_size: bs,
@@ -172,6 +174,31 @@ impl JournalWriter {
     /// the on-disk JSB has been written back twice (dirty marker + clean
     /// marker).
     pub fn commit(&mut self, dev: &dyn BlockDevice, tx: &Transaction) -> Result<()> {
+        if !self.healthy {
+            return Err(Error::Corrupt("journal writer failed; reopen for recovery"));
+        }
+        self.healthy = false;
+        let result = self.commit_inner(dev, tx);
+        if result.is_ok() {
+            self.healthy = true;
+        }
+        result
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    pub(crate) fn finish_replay(fs: &Filesystem, next_sequence: u32) -> Result<()> {
+        let mut writer = Self::open(fs)?.ok_or(Error::Corrupt("replay journal disappeared"))?;
+        fs.dev.flush()?;
+        writer.jsb.start = 0;
+        writer.jsb.sequence = next_sequence;
+        writer.write_jsb(fs.dev.as_ref())?;
+        fs.dev.flush()
+    }
+
+    fn commit_inner(&mut self, dev: &dyn BlockDevice, tx: &Transaction) -> Result<()> {
         if !dev.is_writable() {
             return Err(Error::ReadOnly);
         }
